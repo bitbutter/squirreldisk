@@ -339,7 +339,6 @@ pub struct App {
     pub update_prompted: Option<String>,
     /// "Update now" was chosen: restart as soon as the update is installed.
     pub update_restart: bool,
-    pub sponsors: crate::sponsor::Sponsors,
     /// App icon as a texture, for the home header.
     pub logo: Option<egui::TextureHandle>,
     pub dock: DockState,
@@ -543,7 +542,6 @@ impl App {
             update_checked: Instant::now(),
             update_prompted: None,
             update_restart: false,
-            sponsors: crate::sponsor::Sponsors::start(settings.sponsor_measurement),
             logo: None,
             dock: DockState::default(),
             director: super::director::Director::from_env(),
@@ -565,25 +563,6 @@ impl App {
     fn publish_scans(&self) {
         let done = self.sessions.iter().filter(|s| s.was_done && s.progress.error.lock().unwrap().is_none() && s.source().is_local());
         self.scans.lock().unwrap().set(done.map(|s| (s.tree.clone(), s.watch.is_some())));
-    }
-
-    /// Feeds the local sponsor matcher with the startup disk fill level.
-    pub fn update_sponsor_disk(&self) {
-        let boot = self.volumes.iter().find(|v| v.is_boot).map(|v| v.used_frac());
-        let external = self.volumes.iter().any(|v| v.removable);
-        self.sponsors.set_disk(boot, external);
-    }
-
-    /// Draws the sponsor banner and handles views/clicks.
-    pub fn sponsor_banner(&mut self, ui: &mut egui::Ui, rect: Rect, placement: &'static str) {
-        let personalized = self.settings.personalized_sponsors;
-        let measure = self.settings.sponsor_measurement;
-        let choice = self.sponsors.choose(personalized);
-        self.sponsors.record_view(&choice.ad, placement, measure);
-        let theme = self.theme.clone();
-        if let super::ads::BannerAction::Open = super::ads::banner(ui, rect, egui::Id::new(("sponsor", placement)), &choice, personalized, &theme) {
-            os_open(&self.sponsors.click_url(&choice.ad, placement, measure), false);
-        }
     }
 
     /// Mirrors scan progress in the Dock icon: the ring fills up and the acorn
@@ -804,7 +783,6 @@ impl App {
         let mut sounds: Vec<Sfx> = Vec::new();
         let mut toasts: Vec<(String, Color32)> = Vec::new();
         let mut auth_needed: Option<(String, String)> = None;
-        let mut interest_jobs: Vec<SharedTree> = Vec::new();
         let watch_enabled = self.settings.watch_fs;
         for s in self.sessions.iter_mut() {
             // scan finished?
@@ -821,19 +799,25 @@ impl App {
                     // A finished scan speaks for itself: no toast, just the (optional) sound.
                     sounds.push(Sfx::Success);
                     // SquirrelDisk-AI fork: local pattern pass over the finished
-                    // scan → teaser for the AI panel. Purely local, no network
-                    // (DEC-AI-003): the LLM is only called on an explicit click.
+                    // scan → teaser for the AI panel, and the AI tab opens by
+                    // itself so the Ask button is on screen the moment the scan
+                    // lands (DEC-AI-003: still no network without a click).
                     {
                         let t = s.tree.read().unwrap();
                         s.ai.teaser = crate::ai::teaser(&t);
                     }
                     s.ai.teaser_seen = false;
-                    if s.ai.teaser.as_ref().is_some_and(|x| x.total >= 1_000_000_000 || x.count >= 8) {
-                        let sum: String = s.ai.teaser.as_ref().map(|x| crate::tree::fmt_size(x.total)).unwrap_or_default();
-                        toasts.push((format!("{} · {} in known caches — see the AI tab", s.title, sum), self.theme.accent));
+                    if !self.settings.ai_api_key.trim().is_empty() && !s.ai.manual_files {
+                        s.ai.open = true;
+                        s.ai.teaser_seen = true;
                     }
-                    if s.source().is_local() {
-                        interest_jobs.push(s.tree.clone());
+                    if !self.settings.ai_api_key.trim().is_empty() {
+                        let sum = s.ai.teaser.as_ref().map(|x| crate::tree::fmt_size(x.total));
+                        let msg = match sum {
+                            Some(sz) => format!("{} · {} in known caches — ask the AI what to do", s.title, sz),
+                            None => format!("{} · scan ready — ask the AI what should go", s.title),
+                        };
+                        toasts.push((msg, self.theme.accent));
                     }
                     if watch_enabled && s.source().is_local() {
                         let root = s.tree.read().unwrap().root_path.clone();
@@ -887,12 +871,6 @@ impl App {
         }
         for (t, c) in toasts {
             self.toasts.push(t, c);
-        }
-        if self.settings.personalized_sponsors {
-            for tree in interest_jobs {
-                // On-device only: folder names + sizes already in memory.
-                self.sponsors.learn_from_scan(tree);
-            }
         }
         if let Some((host, path)) = auth_needed {
             let retry = self.ssh_tried.contains(&host);
@@ -977,9 +955,6 @@ impl eframe::App for App {
         self.last_frame = now;
         self.time += self.dt as f64;
         self.apply_theme(&ctx);
-        if self.time < 0.1 {
-            self.update_sponsor_disk();
-        }
         self.direct(&ctx);
         self.marks.clear();
         self.debug_hooks(&ctx);
@@ -992,7 +967,6 @@ impl eframe::App for App {
         if self.volumes_at.elapsed() > Duration::from_secs(5) && self.screen == Screen::Home {
             self.volumes = disks::list();
             self.volumes_at = Instant::now();
-            self.update_sponsor_disk();
         }
 
         // dropped folders → scan

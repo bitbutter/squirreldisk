@@ -358,14 +358,12 @@ impl App {
                 }
                 y += 50.0;
 
-                let rows: [(&str, &str, u8); 7] = [
+                // SquirrelDisk-AI fork: no update toggles (self-update off,
+                // DEC-AI-004) and no sponsor toggles (DEC-AI-009).
+                let rows: [(&str, &str, u8); 3] = [
                     (tr("Sound effects"), tr("Plops, crunches and a little fanfare"), 0),
                     (tr("Shader effects"), tr("GPU-rendered, anti-aliased segments (turn off on very old GPUs)"), 1),
                     (tr("Watch for changes"), tr("Update the chart when files change on disk"), 2),
-                    (tr("Check for updates"), tr("Look for new releases on GitHub at launch"), 3),
-                (tr("Install updates automatically"), tr("Download new versions in the background and apply them on restart"), 6),
-                    (tr("Personalized sponsors"), tr("Picked on this computer from disk categories; nothing about you is sent"), 4),
-                    (tr("Anonymous sponsor stats"), tr("Daily view totals and click counts, with no ID of any kind"), 5),
                 ];
                 for (label, sub, k) in rows {
                     let r = Rect::from_min_size(Pos2::new(x0, y), Vec2::new(w, 44.0));
@@ -376,22 +374,11 @@ impl App {
                     let v = match k {
                         0 => &mut s.sound,
                         1 => &mut s.shader_fx,
-                        2 => &mut s.watch_fs,
-                        4 => &mut s.personalized_sponsors,
-                        _ => &mut s.sponsor_measurement,
+                        _ => &mut s.watch_fs,
                     };
                     widgets::toggle(ui, tgl, Id::new(("set-toggle", k)), v, &theme);
                     y += 46.0;
                 }
-                // Transparency: exactly what the sponsor feature knows, all local.
-                let sig = self.sponsors.signals();
-                let mut known: Vec<&str> = sig.interests.iter().map(|i| i.label()).collect();
-                known.sort();
-                let interests = if !s.personalized_sponsors { tr("off").to_string() } else if known.is_empty() { tr("none yet").to_string() } else { known.join(", ") };
-                let local = trf("Known only on this device: {interests}  ·  views waiting to be reported: {views}", &[("interests", &interests), ("views", &self.sponsors.pending_views())]);
-                let local = widgets::truncate(ui.painter(), &local, &font(11.0), w);
-                ui.painter().text(Pos2::new(x0, y + 4.0), Align2::LEFT_CENTER, local, font(11.0), theme.text_faint);
-                y += 22.0;
                 let p = ui.painter();
                 p.text(Pos2::new(x0, y + 12.0), Align2::LEFT_CENTER, tr("Chart depth"), bold(13.5), theme.text);
                 p.text(Pos2::new(x0, y + 30.0), Align2::LEFT_CENTER, trf("{rings} rings — fewer is faster on old machines", &[("rings", &s.rings)]), font(11.5), theme.text_dim);
@@ -601,9 +588,6 @@ impl App {
             if let Err(e) = done {
                 self.toasts.push(trf("Couldn't install the command: {error}", &[("error", &e)]), self.theme.danger);
             }
-        }
-        if !s.personalized_sponsors && self.settings.personalized_sponsors {
-            self.sponsors.forget_interests();
         }
         let changed = serde_json::to_string(&s).ok() != serde_json::to_string(&self.settings).ok();
         self.settings = s;

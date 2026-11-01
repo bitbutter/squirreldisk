@@ -462,9 +462,14 @@ pub struct AiPanel {
     /// True while the first reply was a parseable triage.
     pub analyzed: bool,
     pub input: String,
-    pub scroll: f32,
-    pub content_h: f32,
     pub verify_open: bool,
+    /// Scroll to the bottom of the conversation at the next frame (a chat
+    /// message was sent or arrived). The triage reply never sets it: its
+    /// summary is at the top and that is where reading starts.
+    pub jump: bool,
+    /// The user deliberately switched back to the FILES tab: stop
+    /// auto-opening the AI tab when scans finish.
+    pub manual_files: bool,
 }
 
 impl Default for AiPanel {
@@ -482,9 +487,9 @@ impl Default for AiPanel {
             follow_ups: Vec::new(),
             analyzed: false,
             input: String::new(),
-            scroll: 0.0,
-            content_h: 0.0,
             verify_open: false,
+            jump: false,
+            manual_files: false,
         }
     }
 }

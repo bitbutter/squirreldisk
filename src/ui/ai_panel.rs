@@ -5,19 +5,22 @@
 //! existing `Session::collect`, so every deletion still passes the app's
 //! safety checks and its confirm dialog (DECISIONS.md, DEC-AI-002). Nothing
 //! the model says is ever executed; suggested commands are copy-only.
+//! Clickable paths navigate the sunburst to the item (DEC-AI-008) — the same
+//! zoom a click on the chart performs; it only ever changes the view.
 
 use super::app::{App, Modal, Target};
+use super::sunburst::View;
 use super::theme::{with_alpha, Theme};
 use super::widgets::{self, bold, cr, font, BtnStyle, Icon};
 use crate::ai::{self, Msg, Phase};
 use crate::i18n::tr;
-use crate::tree::fmt_size;
-use eframe::egui::{self, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
+use crate::tree::{fmt_size, Kind};
+use eframe::egui::{self, Align, Align2, Color32, FontId, Id, Pos2, Rect, Sense, Stroke, Vec2};
 
 /// Panel background + border, shared by the file list and the AI tab.
 pub fn frame(ui: &egui::Ui, panel: Rect, theme: &Theme) {
-    let p = ui.painter().clone();
-    widgets::shadow(&p, panel, 18.0, 0.5, theme);
+    let p = ui.painter();
+    widgets::shadow(p, panel, 18.0, 0.5, theme);
     p.rect_filled(panel, cr(12.0), with_alpha(theme.surface, if theme.dark { 0.72 } else { 0.9 }));
     p.rect_stroke(panel, cr(12.0), Stroke::new(1.0, with_alpha(theme.stroke, 0.6)), egui::StrokeKind::Inside);
 }
@@ -47,7 +50,7 @@ pub fn tabs(app: &mut App, ui: &mut egui::Ui, panel: Rect, si: usize) {
             clicked = Some(is_ai);
         }
     }
-    // unread dot: local teaser waiting on the AI tab
+    // unread dot: scan finished, the AI tab has news
     {
         let s = &mut app.sessions[si];
         if !s.ai.open && s.ai.teaser.is_some() && !s.ai.teaser_seen {
@@ -57,8 +60,12 @@ pub fn tabs(app: &mut App, ui: &mut egui::Ui, panel: Rect, si: usize) {
             Some(true) => {
                 s.ai.open = true;
                 s.ai.teaser_seen = true;
+                s.ai.manual_files = false;
             }
-            Some(false) => s.ai.open = false,
+            Some(false) => {
+                s.ai.open = false;
+                s.ai.manual_files = true; // deliberate switch: stop auto-opening
+            }
             None => {}
         }
     }
@@ -71,6 +78,16 @@ pub struct PanelItemView {
     pub node: Option<u32>,
     pub size: u64,
     pub collected: bool,
+}
+
+/// Actions collected while drawing, applied once the tree lock is gone.
+#[derive(Default)]
+struct Actions {
+    collect: Vec<u32>,
+    navigate: Option<u32>,
+    copy_cmd: Option<String>,
+    /// 0 analyze, 1 send, 2 retry, 3 open settings, 4 expand, 5 toggle verify
+    action: Option<u8>,
 }
 
 impl App {
@@ -115,7 +132,6 @@ impl App {
         s.ai.triage = None;
         s.ai.analyzed = false;
         s.ai.follow_ups.clear();
-        s.ai.scroll = 0.0;
         self.ai_call(si, ai::analyze_system_prompt(), 0.2, ctx);
     }
 
@@ -129,7 +145,9 @@ impl App {
         if text.is_empty() {
             return;
         }
-        self.sessions[si].ai.history.push(ai::user(text));
+        let s = &mut self.sessions[si];
+        s.ai.history.push(ai::user(text));
+        s.ai.jump = true;
         self.ai_call(si, ai::chat_system_prompt(), 0.3, ctx);
     }
 
@@ -152,7 +170,9 @@ impl App {
                 }
             }
         }
-        self.sessions[si].ai.history.push(ai::user(text));
+        let s = &mut self.sessions[si];
+        s.ai.history.push(ai::user(text));
+        s.ai.jump = true;
         self.ai_call(si, ai::chat_system_prompt(), 0.3, ctx);
     }
 
@@ -179,12 +199,14 @@ impl App {
                                 s.ai.follow_ups = t.expand.clone();
                                 s.ai.triage = Some(t);
                             }
+                            // the triage answer reads from the top: no jump
                         } else {
                             let (text, expand) = ai::take_expand_request(&reply);
                             if let Some(p) = expand {
                                 s.ai.follow_ups.push(p);
                             }
                             s.ai.history.push(ai::assistant(text));
+                            s.ai.jump = true;
                         }
                         s.ai.phase = Phase::Done;
                     }
@@ -196,9 +218,7 @@ impl App {
             }
         }
 
-        let mut action: Option<u8> = None; // 0 analyze, 1 send, 2 retry, 3 open settings, 4 expand, 5 toggle verify
-        let mut collect: Vec<u32> = Vec::new();
-        let mut copy_cmd: Option<String> = None;
+        let mut a = Actions::default();
 
         if !configured {
             let inner = Rect::from_min_max(Pos2::new(panel.left() + 18.0, panel.top() + 16.0 + 26.0), Pos2::new(panel.right() - 18.0, panel.bottom() - 16.0));
@@ -214,20 +234,12 @@ impl App {
             p.galley(Pos2::new(inner.left(), inner.top() + 36.0 + gh + 14.0), g2, theme.text_faint);
             let b = Rect::from_min_size(Pos2::new(inner.left(), panel.bottom() - 60.0), Vec2::new(170.0, 34.0));
             if widgets::button(ui, b, Id::new(("ai-settings", si)), tr("Open Settings"), Some(Icon::Gear), BtnStyle::Primary, &theme).clicked() {
-                action = Some(3);
+                a.action = Some(3);
             }
         } else {
             let body = Rect::from_min_max(Pos2::new(panel.left() + 18.0, panel.top() + 16.0 + 26.0), Pos2::new(panel.right() - 18.0, panel.bottom() - 16.0 - 44.0));
             let input = Rect::from_min_size(Pos2::new(body.left(), panel.bottom() - 16.0 - 32.0), Vec2::new(body.width() - 48.0, 32.0));
             let send_r = Rect::from_min_size(Pos2::new(input.right() + 8.0, input.top()), Vec2::new(40.0, 32.0));
-
-            // scroll bookkeeping (same pattern as the settings modal)
-            if ui.rect_contains_pointer(body) {
-                self.sessions[si].ai.scroll -= ui.input(|i| i.smooth_scroll_delta.y);
-            }
-            let max_scroll = (self.sessions[si].ai.content_h - body.height()).max(0.0);
-            self.sessions[si].ai.scroll = self.sessions[si].ai.scroll.clamp(0.0, max_scroll);
-            let top = body.top() - self.sessions[si].ai.scroll;
 
             // gather view data under one tree lock
             let (teaser, triage_view, history, phase, follow_ups, verify_open) = {
@@ -238,7 +250,7 @@ impl App {
                         .iter()
                         .map(|it| {
                             let (id, exact) = ai::resolve_path(&t, &it.path);
-                            let node = (exact && t.is_alive(id) && id != t.root && !matches!(t.get(id).kind, crate::tree::Kind::Hidden | crate::tree::Kind::Mount)).then_some(id);
+                            let node = (exact && t.is_alive(id) && id != t.root && !matches!(t.get(id).kind, Kind::Hidden | Kind::Mount)).then_some(id);
                             let size = node.map(|n| t.get(n).size).unwrap_or(0);
                             let collected = node.is_some_and(|n| s.is_collected(&t, n));
                             PanelItemView {
@@ -256,157 +268,213 @@ impl App {
             };
             let busy = phase == Phase::Busy;
 
-            let mut p = ui.painter().clone();
-            p.set_clip_rect(panel);
-            let mut y = top;
+            // A real ScrollArea: wheel, touch, scrollbar, correct clamping and
+            // interaction clipping (off-screen rows can no longer be clicked).
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body), |su| {
+                egui::ScrollArea::vertical()
+                    .id_salt(Id::new(("ai-scroll", si)))
+                    .auto_shrink([false, false])
+                    .show(su, |inner| {
+                        let p = inner.painter().clone();
+                        let left = inner.cursor().left();
+                        let w = inner.available_width().max(1.0);
+                        let right = left + w;
+                        let y0 = inner.cursor().top();
+                        let mut y = y0;
 
-            // teaser (local, free)
-            if let Some(te) = &teaser {
-                let txt = format!("{} · {} in {} known cache/build folders", tr("Local pass"), fmt_size(te.total), te.count);
-                let g = p.layout(txt, font(11.5), theme.text_faint, body.width());
-                p.galley(Pos2::new(body.left(), y), g, theme.text_faint);
-                y += 20.0;
-            }
-
-            // idle: the Ask button
-            if phase == Phase::Idle && !self.sessions[si].ai.analyzed {
-                let b = Rect::from_min_size(Pos2::new(body.left(), y + 6.0), Vec2::new(body.width(), 40.0));
-                if widgets::button_ex(ui, b, Id::new(("ai-analyze", si)), tr("Analyze this scan"), None, BtnStyle::Primary, &theme, !scanning).clicked() {
-                    action = Some(0);
-                }
-                let host = self.settings.ai_endpoint.trim_start_matches("https://").split('/').next().unwrap_or("").to_string();
-                let note = format!("{} · {} {}", self.settings.ai_model, tr("sends folder names and sizes to"), host);
-                let g = p.layout(note, font(10.5), theme.text_faint, body.width());
-                p.galley(Pos2::new(body.left(), y + 52.0), g, theme.text_faint);
-                y += 76.0;
-            }
-
-            match phase {
-                Phase::Busy => {
-                    let dots = ".".repeat((self.time as usize * 2 % 3) + 1);
-                    p.text(Pos2::new(body.left(), y + 8.0), Align2::LEFT_CENTER, format!("{}{}", tr("Thinking"), dots), bold(13.0), theme.accent2);
-                    y += 28.0;
-                }
-                Phase::Error => {
-                    let err = self.sessions[si].ai.error.clone().unwrap_or_default();
-                    let g = p.layout(format!("{} {err}", tr("Request failed:")), font(12.0), theme.danger, body.width());
-                    let gh = g.size().y;
-                    p.galley(Pos2::new(body.left(), y), g, theme.danger);
-                    y += gh + 6.0;
-                    let b = Rect::from_min_size(Pos2::new(body.left(), y), Vec2::new(110.0, 30.0));
-                    if widgets::button(ui, b, Id::new(("ai-retry", si)), tr("Retry"), Some(Icon::Refresh), BtnStyle::Subtle, &theme).clicked() {
-                        action = Some(2);
-                    }
-                    y += 38.0;
-                }
-                _ => {}
-            }
-
-            // triage
-            if let Some((safe, verify, your_call, summary, reclaimable, commands)) = triage_view {
-                if !summary.is_empty() {
-                    let g = p.layout(summary, font(12.5), theme.text, body.width());
-                    let gh = g.size().y;
-                    p.galley(Pos2::new(body.left(), y), g, theme.text);
-                    y += gh + 8.0;
-                }
-                if !reclaimable.is_empty() {
-                    p.text(Pos2::new(body.left(), y), Align2::LEFT_CENTER, format!("{} {reclaimable}", tr("Reclaimable:")), bold(13.0), theme.ok);
-                    y += 22.0;
-                }
-                if !safe.is_empty() {
-                    let safe_bytes: u64 = safe.iter().map(|i| i.size).sum();
-                    let (h, a) = self.ai_tier_header(ui, body, y, tr("SAFE"), theme.ok, safe.len(), safe_bytes, Some(tr("Collect all")), &theme, si, 0);
-                    if a {
-                        collect.extend(safe.iter().filter_map(|i| i.node));
-                    }
-                    y += h;
-                    for it in safe.iter() {
-                        y += self.ai_item_row(ui, body, y, it, theme.ok, &theme, si, 's', &mut collect);
-                    }
-                }
-                if !verify.is_empty() {
-                    let verify_bytes: u64 = verify.iter().map(|i| i.size).sum();
-                    let label = if verify_open { tr("Hide") } else { tr("Review") };
-                    let (h, a) = self.ai_tier_header(ui, body, y, tr("VERIFY"), theme.warn, verify.len(), verify_bytes, Some(label), &theme, si, 1);
-                    if a {
-                        action = Some(5);
-                    }
-                    y += h;
-                    if verify_open {
-                        for it in verify.iter() {
-                            y += self.ai_item_row(ui, body, y, it, theme.warn, &theme, si, 'v', &mut collect);
+                        // teaser (local, free)
+                        if let Some(te) = &teaser {
+                            let txt = format!("{} · {} in {} known cache/build folders", tr("Local pass"), fmt_size(te.total), te.count);
+                            let g = p.layout(txt, font(11.5), theme.text_faint, w);
+                            let gh = g.size().y;
+                            p.galley(Pos2::new(left, y), g, theme.text_faint);
+                            y += gh + 4.0;
                         }
-                    }
-                }
-                if !your_call.is_empty() {
-                    let yc_bytes: u64 = your_call.iter().map(|i| i.size).sum();
-                    let (h, _) = self.ai_tier_header(ui, body, y, tr("YOUR CALL"), theme.text_dim, your_call.len(), yc_bytes, None, &theme, si, 2);
-                    y += h;
-                    for it in your_call.iter() {
-                        y += self.ai_item_row(ui, body, y, it, theme.text_dim, &theme, si, 'y', &mut collect);
-                    }
-                }
-                if !commands.is_empty() {
-                    p.text(Pos2::new(body.left(), y + 2.0), Align2::LEFT_CENTER, tr("SUGGESTED COMMANDS"), bold(10.5), theme.text_faint);
-                    y += 20.0;
-                    for (ci, c) in commands.iter().enumerate() {
-                        let mono = FontId::monospace(11.0);
-                        let w = (body.width() - 74.0).max(60.0);
-                        let line = widgets::truncate(&p, &c.command, &mono, w);
-                        p.text(Pos2::new(body.left() + 6.0, y + 8.0), Align2::LEFT_CENTER, line, mono, theme.text);
-                        let cb = Rect::from_min_size(Pos2::new(body.right() - 66.0, y), Vec2::new(66.0, 26.0));
-                        if widgets::button(ui, cb, Id::new(("ai-cmd", si, ci)), tr("Copy"), None, BtnStyle::Subtle, &theme).clicked() {
-                            copy_cmd = Some(c.command.clone());
+
+                        // idle: the Ask button
+                        if phase == Phase::Idle && !self.sessions[si].ai.analyzed {
+                            let b = Rect::from_min_size(Pos2::new(left, y + 6.0), Vec2::new(w, 40.0));
+                            if widgets::button_ex(inner, b, Id::new(("ai-analyze", si)), tr("Analyze this scan"), None, BtnStyle::Primary, &theme, !scanning).clicked() {
+                                a.action = Some(0);
+                            }
+                            let host = self.settings.ai_endpoint.trim_start_matches("https://").split('/').next().unwrap_or("").to_string();
+                            let note = format!("{} · {} {}", self.settings.ai_model, tr("sends folder names and sizes to"), host);
+                            let g = p.layout(note, font(10.5), theme.text_faint, w);
+                            let gh = g.size().y;
+                            p.galley(Pos2::new(left, y + 52.0), g, theme.text_faint);
+                            y += 52.0 + gh + 8.0;
                         }
-                        let why = widgets::truncate(&p, &c.why, &font(10.5), body.width() - 12.0);
-                        p.text(Pos2::new(body.left() + 6.0, y + 24.0), Align2::LEFT_CENTER, why, font(10.5), theme.text_faint);
-                        y += 40.0;
-                    }
-                }
-                y += 8.0;
-            }
 
-            // follow-up expansions the model asked for
-            if !follow_ups.is_empty() && !busy {
-                let g = p.layout(tr("The AI wants to look inside:").to_string(), bold(11.5), theme.text_dim, body.width());
-                let gh = g.size().y;
-                p.galley(Pos2::new(body.left(), y), g, theme.text_dim);
-                y += gh + 4.0;
-                for path in follow_ups.iter() {
-                    let mono = FontId::monospace(10.5);
-                    let line = widgets::truncate(&p, path, &mono, body.width() - 8.0);
-                    p.text(Pos2::new(body.left() + 8.0, y), Align2::LEFT_CENTER, line, mono, theme.accent2);
-                    y += 16.0;
-                }
-                let b = Rect::from_min_size(Pos2::new(body.left(), y + 4.0), Vec2::new(160.0, 28.0));
-                if widgets::button(ui, b, Id::new(("ai-expand", si)), tr("Send expansions"), Some(Icon::Eye), BtnStyle::Subtle, &theme).clicked() {
-                    action = Some(4);
-                }
-                y += 38.0;
-            }
+                        match phase {
+                            Phase::Busy => {
+                                let dots = ".".repeat((self.time as usize * 2 % 3) + 1);
+                                p.text(Pos2::new(left, y + 8.0), Align2::LEFT_CENTER, format!("{}{}", tr("Thinking"), dots), bold(13.0), theme.accent2);
+                                y += 28.0;
+                            }
+                            Phase::Error => {
+                                let err = self.sessions[si].ai.error.clone().unwrap_or_default();
+                                let g = p.layout(format!("{} {err}", tr("Request failed:")), font(12.0), theme.danger, w);
+                                let gh = g.size().y;
+                                p.galley(Pos2::new(left, y), g, theme.danger);
+                                y += gh + 6.0;
+                                let b = Rect::from_min_size(Pos2::new(left, y), Vec2::new(110.0, 30.0));
+                                if widgets::button(inner, b, Id::new(("ai-retry", si)), tr("Retry"), Some(Icon::Refresh), BtnStyle::Subtle, &theme).clicked() {
+                                    a.action = Some(2);
+                                }
+                                y += 38.0;
+                            }
+                            _ => {}
+                        }
 
-            // chat history (skip [0]=dossier; [1] is rendered above when it parsed as triage)
-            let skip_first_reply = self.sessions[si].ai.triage.is_some();
-            let start = 1 + skip_first_reply as usize;
-            for m in history.iter().skip(start) {
-                if m.role == "user" {
-                    let g = p.layout(format!("{} {}", tr("you:"), m.content), font(12.0), theme.accent2, body.width() - 8.0);
-                    let gh = g.size().y;
-                    p.galley(Pos2::new(body.left() + 8.0, y + 6.0), g, theme.accent2);
-                    y += gh + 12.0;
-                } else {
-                    let g = p.layout(m.content.clone(), font(12.0), theme.text, body.width());
-                    let h = g.size().y + 10.0;
-                    p.rect_filled(Rect::from_min_size(Pos2::new(body.left(), y), Vec2::new(2.0, h)), cr(1.0), with_alpha(theme.accent, 0.5));
-                    p.galley(Pos2::new(body.left() + 10.0, y), g, theme.text);
-                    y += h;
-                }
-            }
-            y += 4.0;
-            self.sessions[si].ai.content_h = y - body.top() + 8.0;
+                        // triage
+                        if let Some((safe, verify, your_call, summary, reclaimable, commands)) = triage_view {
+                            if !summary.is_empty() {
+                                let g = p.layout(summary, font(12.5), theme.text, w);
+                                let gh = g.size().y;
+                                p.galley(Pos2::new(left, y), g, theme.text);
+                                y += gh + 8.0;
+                            }
+                            if !reclaimable.is_empty() {
+                                p.text(Pos2::new(left, y), Align2::LEFT_CENTER, format!("{} {reclaimable}", tr("Reclaimable:")), bold(13.0), theme.ok);
+                                y += 22.0;
+                            }
+                            if !safe.is_empty() {
+                                let safe_bytes: u64 = safe.iter().map(|i| i.size).sum();
+                                let (h, clicked) = self.ai_tier_header(inner, left, right, y, tr("SAFE"), theme.ok, safe.len(), safe_bytes, Some(tr("Collect all")), &theme, si, 0);
+                                if clicked {
+                                    a.collect.extend(safe.iter().filter_map(|i| i.node));
+                                }
+                                y += h;
+                                for it in safe.iter() {
+                                    y += self.ai_item_row(inner, left, right, y, w, it, theme.ok, &theme, si, 's', &mut a);
+                                }
+                            }
+                            if !verify.is_empty() {
+                                let verify_bytes: u64 = verify.iter().map(|i| i.size).sum();
+                                let label = if verify_open { tr("Hide") } else { tr("Review") };
+                                let (h, clicked) = self.ai_tier_header(inner, left, right, y, tr("VERIFY"), theme.warn, verify.len(), verify_bytes, Some(label), &theme, si, 1);
+                                if clicked {
+                                    a.action = Some(5);
+                                }
+                                y += h;
+                                if verify_open {
+                                    for it in verify.iter() {
+                                        y += self.ai_item_row(inner, left, right, y, w, it, theme.warn, &theme, si, 'v', &mut a);
+                                    }
+                                }
+                            }
+                            if !your_call.is_empty() {
+                                let yc_bytes: u64 = your_call.iter().map(|i| i.size).sum();
+                                let (h, _) = self.ai_tier_header(inner, left, right, y, tr("YOUR CALL"), theme.text_dim, your_call.len(), yc_bytes, None, &theme, si, 2);
+                                y += h;
+                                for it in your_call.iter() {
+                                    y += self.ai_item_row(inner, left, right, y, w, it, theme.text_dim, &theme, si, 'y', &mut a);
+                                }
+                            }
+                            if !commands.is_empty() {
+                                p.text(Pos2::new(left, y + 2.0), Align2::LEFT_CENTER, tr("SUGGESTED COMMANDS"), bold(10.5), theme.text_faint);
+                                y += 20.0;
+                                for (ci, c) in commands.iter().enumerate() {
+                                    let mono = FontId::monospace(11.0);
+                                    let cw = (w - 74.0).max(60.0);
+                                    let line = widgets::truncate(&p, &c.command, &mono, cw);
+                                    p.text(Pos2::new(left + 6.0, y + 8.0), Align2::LEFT_CENTER, line, mono, theme.text);
+                                    let cb = Rect::from_min_size(Pos2::new(right - 66.0, y), Vec2::new(66.0, 26.0));
+                                    if widgets::button(inner, cb, Id::new(("ai-cmd", si, ci)), tr("Copy"), None, BtnStyle::Subtle, &theme).clicked() {
+                                        a.copy_cmd = Some(c.command.clone());
+                                    }
+                                    let why = widgets::truncate(&p, &c.why, &font(10.5), w - 12.0);
+                                    p.text(Pos2::new(left + 6.0, y + 24.0), Align2::LEFT_CENTER, why, font(10.5), theme.text_faint);
+                                    y += 40.0;
+                                }
+                            }
+                            y += 8.0;
+                        }
 
-            // input row
+                        // follow-up expansions the model asked for
+                        if !follow_ups.is_empty() && !busy {
+                            let g = p.layout(tr("The AI wants to look inside:").to_string(), bold(11.5), theme.text_dim, w);
+                            let gh = g.size().y;
+                            p.galley(Pos2::new(left, y), g, theme.text_dim);
+                            y += gh + 4.0;
+                            for path in follow_ups.iter() {
+                                let mono = FontId::monospace(10.5);
+                                let line = widgets::truncate(&p, path, &mono, w - 8.0);
+                                let lh = 16.0;
+                                let rr = Rect::from_min_size(Pos2::new(left + 4.0, y), Vec2::new(w - 8.0, lh));
+                                let node = {
+                                    let t = self.sessions[si].tree.read().unwrap();
+                                    let (id, exact) = ai::resolve_path(&t, path);
+                                    (exact && t.is_alive(id) && id != t.root).then_some(id)
+                                };
+                                let resp = inner.interact(rr, Id::new(("ai-fu", si, path.as_str())), Sense::click());
+                                if resp.hovered() && node.is_some() {
+                                    p.rect_filled(rr, cr(4.0), with_alpha(theme.accent, 0.12));
+                                    inner.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                p.text(Pos2::new(left + 8.0, y), Align2::LEFT_CENTER, line, mono, if node.is_some() { theme.accent2 } else { theme.text_faint });
+                                if resp.clicked() {
+                                    if let Some(n) = node {
+                                        a.navigate = Some(n);
+                                    }
+                                }
+                                y += lh;
+                            }
+                            let b = Rect::from_min_size(Pos2::new(left, y + 4.0), Vec2::new(160.0, 28.0));
+                            if widgets::button(inner, b, Id::new(("ai-expand", si)), tr("Send expansions"), Some(Icon::Eye), BtnStyle::Subtle, &theme).clicked() {
+                                a.action = Some(4);
+                            }
+                            y += 38.0;
+                        }
+
+                        // chat history (skip [0]=dossier; [1] is rendered above when it parsed as triage)
+                        let skip_first_reply = self.sessions[si].ai.triage.is_some();
+                        let start = 1 + skip_first_reply as usize;
+                        for m in history.iter().skip(start) {
+                            if m.role == "user" {
+                                let g = p.layout(format!("{} {}", tr("you:"), m.content), font(12.0), theme.accent2, w - 8.0);
+                                let gh = g.size().y;
+                                p.galley(Pos2::new(left + 8.0, y + 6.0), g, theme.accent2);
+                                y += gh + 12.0;
+                            } else {
+                                // assistant text, line by line: a line that
+                                // names a real path is clickable and zooms
+                                // the sunburst to it (DEC-AI-008)
+                                for line in m.content.lines() {
+                                    let g = p.layout(line.to_string(), font(12.0), theme.text, w - 12.0);
+                                    let gh = g.size().y.max(14.0);
+                                    let rr = Rect::from_min_size(Pos2::new(left + 2.0, y), Vec2::new(w - 4.0, gh));
+                                    let node = self.ai_path_in_line(si, line);
+                                    let id = Id::new(("ai-line", si, y as u32, line.len()));
+                                    let resp = inner.interact(rr, id, if node.is_some() { Sense::click() } else { Sense::hover() });
+                                    let hov = resp.hovered() && node.is_some();
+                                    if hov {
+                                        p.rect_filled(rr, cr(4.0), with_alpha(theme.accent, 0.10));
+                                        inner.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+                                    p.galley(Pos2::new(left + 10.0, y), g, theme.text);
+                                    if resp.clicked() {
+                                        if let Some((_, n)) = node {
+                                            a.navigate = Some(n);
+                                        }
+                                    }
+                                    y += gh + 2.0;
+                                }
+                                y += 8.0;
+                            }
+                        }
+
+                        // tell the ScrollArea how tall the content is
+                        let total = (y - y0 + 4.0).max(4.0);
+                        let end = inner.allocate_exact_size(Vec2::new(w, total), Sense::hover());
+                        if self.sessions[si].ai.jump {
+                            end.1.scroll_to_me(Some(Align::Max));
+                            self.sessions[si].ai.jump = false;
+                        }
+                    });
+            });
+
+            // input row (pinned below the scroll area)
             let can_send = !busy && !self.sessions[si].ai.input.trim().is_empty();
             let resp = ui.put(
                 input,
@@ -415,15 +483,15 @@ impl App {
                     .desired_width(input.width()),
             );
             if widgets::button_ex(ui, send_r, Id::new(("ai-send", si)), "→", Some(Icon::Forward), BtnStyle::Primary, &theme, can_send).clicked() {
-                action = Some(1);
+                a.action = Some(1);
             }
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_send {
-                action = Some(1);
+                a.action = Some(1);
             }
         }
 
-        // apply actions
-        match action {
+        // apply actions (tree lock and borrows are gone)
+        match a.action {
             Some(0) => self.ai_analyze(si, &ctx),
             Some(1) => self.ai_send_chat(si, &ctx),
             Some(2) => self.ai_call(si, ai::chat_system_prompt(), 0.3, &ctx),
@@ -432,23 +500,52 @@ impl App {
             Some(5) => self.sessions[si].ai.verify_open = !self.sessions[si].ai.verify_open,
             _ => {}
         }
-        for node in collect {
+        for node in a.collect {
             if self.sessions[si].collect(node) {
                 self.sfx(crate::sound::Sfx::Plop);
                 self.bin_bounce = 1.0;
             }
         }
-        if let Some(c) = copy_cmd {
+        if let Some(n) = a.navigate {
+            self.sessions[si].navigate(View::node(n));
+            self.sfx(crate::sound::Sfx::Blip);
+        }
+        if let Some(c) = a.copy_cmd {
             ctx.copy_text(c);
             self.toasts.push(tr("Copied").into(), self.theme.accent);
         }
+    }
+
+    /// If `line` names exactly one path that exists in the scan, return it
+    /// with its node. Cheap: token filter first, tree walk only for suspects.
+    fn ai_path_in_line(&self, si: usize, line: &str) -> Option<(String, u32)> {
+        if !line.contains('/') && !line.contains('\\') && !line.contains('.') {
+            return None;
+        }
+        let t = self.sessions[si].tree.read().unwrap();
+        let mut best: Option<(String, u32)> = None;
+        for tok in line.split(|c: char| c == ' ' || c == '`' || c == '"' || c == ',' || c == '(' || c == ')' || c == '[' || c == ']') {
+            let tok = tok.trim().trim_end_matches('.').trim_matches(':');
+            if tok.len() < 3 || !tok.contains('/') && !tok.contains('\\') && !tok.contains('.') {
+                continue;
+            }
+            let (id, exact) = ai::resolve_path(&t, tok);
+            if exact && t.is_alive(id) && id != t.root && t.can_enter(id) {
+                let longer = best.as_ref().map(|(b, _)| b.len() < tok.len()).unwrap_or(true);
+                if longer {
+                    best = Some((tok.to_string(), id));
+                }
+            }
+        }
+        best
     }
 
     /// Tier header row; returns its height and whether its button was clicked.
     fn ai_tier_header(
         &mut self,
         ui: &mut egui::Ui,
-        body: Rect,
+        left: f32,
+        right: f32,
         y: f32,
         label: &str,
         color: Color32,
@@ -460,69 +557,81 @@ impl App {
         tier: u8,
     ) -> (f32, bool) {
         let p = ui.painter().clone();
-        p.text(Pos2::new(body.left(), y + 8.0), Align2::LEFT_CENTER, label, bold(11.0), color);
+        p.text(Pos2::new(left, y + 8.0), Align2::LEFT_CENTER, label, bold(11.0), color);
         let info = format!("{n} · {}", fmt_size(bytes));
         let mut clicked = false;
         let bw = btn.map(|b| p.layout_no_wrap(b.to_string(), bold(11.0), Color32::WHITE).size().x + 24.0);
-        p.text(
-            Pos2::new(body.right() - bw.unwrap_or(0.0) - 4.0, y + 8.0),
-            Align2::RIGHT_CENTER,
-            info,
-            font(11.0),
-            theme.text_dim,
-        );
+        p.text(Pos2::new(right - bw.unwrap_or(0.0) - 4.0, y + 8.0), Align2::RIGHT_CENTER, info, font(11.0), theme.text_dim);
         if let (Some(b), Some(w)) = (btn, bw) {
-            let r = Rect::from_min_size(Pos2::new(body.right() - w, y), Vec2::new(w, 22.0));
+            let r = Rect::from_min_size(Pos2::new(right - w, y), Vec2::new(w, 22.0));
             if widgets::button(ui, r, Id::new(("ai-tier", si, tier)), b, None, BtnStyle::Subtle, theme).clicked() {
                 clicked = true;
             }
         }
-        p.line_segment([Pos2::new(body.left(), y + 21.0), Pos2::new(body.right(), y + 21.0)], Stroke::new(1.0, with_alpha(theme.stroke, 0.5)));
+        p.line_segment([Pos2::new(left, y + 21.0), Pos2::new(right, y + 21.0)], Stroke::new(1.0, with_alpha(theme.stroke, 0.5)));
         (28.0, clicked)
     }
 
-    /// One suggestion row; returns its height. Collect clicks go into `collect`.
+    /// One suggestion row; returns its height. The path text itself zooms the
+    /// sunburst to the item (DEC-AI-008); the [+] stages it into the collector.
     fn ai_item_row(
         &mut self,
         ui: &mut egui::Ui,
-        body: Rect,
+        left: f32,
+        right: f32,
         y: f32,
+        w: f32,
         it: &PanelItemView,
         color: Color32,
         theme: &Theme,
         si: usize,
         tier: char,
-        collect: &mut Vec<u32>,
+        a: &mut Actions,
     ) -> f32 {
         let p = ui.painter().clone();
         let valid = it.node.is_some();
-        let w = body.width();
         let mono = FontId::monospace(11.0);
         // tier tick
-        p.rect_filled(Rect::from_min_size(Pos2::new(body.left(), y + 2.0), Vec2::new(2.0, 30.0)), cr(1.0), with_alpha(color, 0.7));
+        p.rect_filled(Rect::from_min_size(Pos2::new(left, y + 2.0), Vec2::new(2.0, 30.0)), cr(1.0), with_alpha(color, 0.7));
         if valid {
             let path_line = widgets::truncate(&p, &it.path, &mono, w - 96.0);
-            p.text(Pos2::new(body.left() + 8.0, y + 8.0), Align2::LEFT_CENTER, path_line, mono, theme.text);
-            p.text(Pos2::new(body.right() - 36.0, y + 8.0), Align2::RIGHT_CENTER, fmt_size(it.size), bold(11.0), theme.text_dim);
+            let g = p.layout_no_wrap(path_line.clone(), mono.clone(), theme.text);
+            let pw = g.size().x;
+            // path text = zoom link
+            let lr = Rect::from_min_size(Pos2::new(left + 8.0, y - 2.0), Vec2::new(pw + 6.0, 20.0));
+            let resp = ui.interact(lr, Id::new(("ai-path", si, tier, it.path.as_str())), Sense::click());
+            let hov = resp.hovered();
+            if hov {
+                p.rect_filled(lr, cr(4.0), with_alpha(theme.accent, 0.12));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                p.line_segment([Pos2::new(lr.left() + 1.0, lr.bottom() - 3.0), Pos2::new(lr.left() + pw + 4.0, lr.bottom() - 3.0)], Stroke::new(1.0, theme.accent));
+            }
+            p.text(Pos2::new(left + 10.0, y + 8.0), Align2::LEFT_CENTER, path_line, mono, if hov { theme.text } else { theme.text });
+            if resp.clicked() {
+                if let Some(node) = it.node {
+                    a.navigate = Some(node);
+                }
+            }
+            p.text(Pos2::new(right - 36.0, y + 8.0), Align2::RIGHT_CENTER, fmt_size(it.size), bold(11.0), theme.text_dim);
             if it.collected {
-                widgets::draw_icon(&p, Icon::Check, Rect::from_center_size(Pos2::new(body.right() - 20.0, y + 8.0), Vec2::splat(13.0)), theme.ok);
+                widgets::draw_icon(&p, Icon::Check, Rect::from_center_size(Pos2::new(right - 20.0, y + 8.0), Vec2::splat(13.0)), theme.ok);
             } else {
-                let b = Rect::from_center_size(Pos2::new(body.right() - 20.0, y + 8.0), Vec2::splat(22.0));
+                let b = Rect::from_center_size(Pos2::new(right - 20.0, y + 8.0), Vec2::splat(22.0));
                 if widgets::icon_button(ui, b, Id::new(("ai-chip", si, tier, it.path.as_str())), Icon::Plus, theme, true).clicked() {
                     if let Some(node) = it.node {
-                        collect.push(node);
+                        a.collect.push(node);
                     }
                 }
             }
         } else {
             let path_line = widgets::truncate(&p, &it.path, &mono, w - 84.0);
-            p.text(Pos2::new(body.left() + 8.0, y + 8.0), Align2::LEFT_CENTER, path_line, mono, theme.text_faint);
+            p.text(Pos2::new(left + 8.0, y + 8.0), Align2::LEFT_CENTER, path_line, mono, theme.text_faint);
             if tier != 'y' {
-                p.text(Pos2::new(body.right() - 4.0, y + 8.0), Align2::RIGHT_CENTER, tr("not in scan"), font(9.5), theme.warn);
+                p.text(Pos2::new(right - 4.0, y + 8.0), Align2::RIGHT_CENTER, tr("not in scan"), font(9.5), theme.warn);
             }
         }
         let reason = widgets::truncate(&p, &it.reason, &font(10.5), w - 24.0);
-        p.text(Pos2::new(body.left() + 14.0, y + 24.0), Align2::LEFT_CENTER, reason, font(10.5), theme.text_faint);
+        p.text(Pos2::new(left + 14.0, y + 24.0), Align2::LEFT_CENTER, reason, font(10.5), theme.text_faint);
         40.0
     }
 }

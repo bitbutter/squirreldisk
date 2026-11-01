@@ -25,8 +25,6 @@ mod icon;
 #[cfg(feature = "gui")]
 mod sound;
 #[cfg(feature = "gui")]
-mod sponsor;
-#[cfg(feature = "gui")]
 mod ui;
 #[cfg(feature = "gui")]
 mod update;

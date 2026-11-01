@@ -12,7 +12,7 @@ Context: LLM judgment degrades in noise; local code does counting/sorting better
 
 DEC-AI-002: The model proposes, the collector disposes. Model output is data, never actions: every suggested path is validated against the live tree (`ai::resolve_path`), becomes a collector candidate via the existing `Session::collect`, and every deletion still passes the app's safety rules and confirm dialog. Suggested shell commands are copy-only; the app never executes anything the model said.
 
-DEC-AI-003: No network call without a click. Scan completion runs a local pattern pass only (the teaser); the LLM is contacted solely on explicit Ask/Analyze/Send clicks. Auto-call settings do not exist.
+DEC-AI-003: No network call without a click. Scan completion runs a local pattern pass only (the teaser) and opens the AI tab (unless the user deliberately switched back to FILES); the LLM is contacted solely on explicit Ask/Analyze/Send clicks. Auto-call settings do not exist.
 
 Context: Until the first click, a scan is entirely local; outbound traffic carrying folder names must stay a deliberate act.
 
@@ -25,6 +25,9 @@ DEC-AI-006: Tier affordance tracks provenance. SAFE items (pattern-matched or cl
 Context: Staging in the collector is reversible; the irreversible delete click always remains the app's own confirmed flow.
 
 DEC-AI-007: The first reply is parsed as structured JSON (triage with tiers, commands, expand requests); chat follow-ups are plain prose. If the JSON parse fails, the raw reply is shown as prose rather than discarded. Expand requests travel as a trailing `EXPAND: <path>` line or the triage `expand` array, answered by a locally generated depth-2 listing — never a rescan.
+DEC-AI-008: Every path the AI panel shows is a navigation link. Path text in triage rows and expansion requests, and any chat line that names exactly one resolvable path, zooms the sunburst to that item on click (`Session::navigate`) — the same view change as clicking a slice. Navigation never selects for deletion; staging stays a separate explicit action ([+] or bulk buttons).
+
+DEC-AI-009: The fork carries no advertising or sponsor surface: the sponsor module, banner widget, on-device interest matching and its daily view-count reporting are removed, and Settings has no toggles for them. After this removal the only outbound request the app ever makes on its own is none — the AI endpoint is contacted solely on an explicit click (see DEC-AI-003).
 
 ## Open
 
@@ -32,4 +35,4 @@ DEC-AI-007: The first reply is parsed as structured JSON (triage with tiers, com
 - Scan snapshots + diff ("where did my space go since last month") — computed locally, LLM narrates.
 - Duplicate-finder results could feed the dossier when a dupes run exists for the same tree.
 - Streaming replies (SSE) instead of blocking wait with a spinner.
-- The sponsor banner and update window are untouched upstream code; the update window can no longer open (state stays Idle).
+- The update window is untouched upstream code and can no longer open (updater state stays Idle).

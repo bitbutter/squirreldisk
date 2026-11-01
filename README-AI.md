@@ -11,6 +11,8 @@ The fork lives on the `ai-integration` branch. Upstream code is left intact wher
 - **Chips, not actions.** Every suggested path is validated against the live tree; valid ones can be staged into the collector individually or (SAFE only) in bulk. Deletion still goes through the app's own protected-location rules and confirm dialog. Nothing the model outputs is ever executed.
 - **Chat + drill-down.** Follow-up questions in the same panel. If the model needs to see inside a folder, it asks via `EXPAND: <path>`; the app answers with a locally generated listing — a lookup, not a rescan.
 - **Self-update is disabled** (DECISIONS.md, DEC-AI-004): an upstream release binary would overwrite the fork. Settings shows a static version line instead.
+- **No advertising** (DEC-AI-009): the sponsor system (banner, on-device interest matching, daily view-count reporting) is removed entirely. The side panel and home page keep the freed space; the app's only outbound request is the AI endpoint, and only on an explicit click.
+- **Clickable paths** (DEC-AI-008): path text in triage rows and expansion requests, and chat lines that name a resolvable path, zoom the sunburst to that item.
 
 ## Setup
 

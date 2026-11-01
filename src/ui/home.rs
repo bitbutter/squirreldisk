@@ -136,10 +136,6 @@ impl App {
         }
         y += 76.0;
 
-        let ad_rect = Rect::from_min_size(Pos2::new(x0, y), Vec2::new(w, 52.0));
-        self.sponsor_banner(ui, ad_rect, "home");
-        y += 64.0;
-
         let p = ui.painter();
         let foot = format!("v{} · {}", env!("CARGO_PKG_VERSION"), tr("drop a folder anywhere to scan it · Esc goes back"));
         let foot_y = (y + 20.0).max(screen.bottom() - 26.0 - self.home_scroll);

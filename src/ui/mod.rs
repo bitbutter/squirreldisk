@@ -14,7 +14,6 @@ pub mod debug;
 pub mod dupes;
 #[cfg(target_os = "macos")]
 pub mod macos;
-pub mod ads;
 pub mod ai_panel;
 pub mod director;
 pub mod treemap;

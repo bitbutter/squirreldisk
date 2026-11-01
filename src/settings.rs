@@ -71,10 +71,6 @@ pub struct Settings {
     pub backup_folder: Option<String>,
     pub backup_remote: Option<String>,
     pub skipped_version: Option<String>,
-    /// Choose sponsors from on-device signals (nothing is sent).
-    pub personalized_sponsors: bool,
-    /// Send anonymous daily view totals / count clicks.
-    pub sponsor_measurement: bool,
     /// "Scan with SquirrelDisk" in the file manager's menu for folders.
     pub folder_menu: bool,
     /// The `squirreldisk` command was set up (or tried) at first launch.
@@ -102,8 +98,6 @@ impl Default for Settings {
             backup_folder: None,
             backup_remote: None,
             skipped_version: None,
-            personalized_sponsors: true,
-            sponsor_measurement: true,
             folder_menu: false,
             cli_offered: false,
             ai_endpoint: AI_ENDPOINT_DEFAULT.into(),
