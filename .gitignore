@@ -2,3 +2,6 @@
 *.bmp
 .DS_Store
 /web
+.chainlink/
+.claude/
+.mcp.json

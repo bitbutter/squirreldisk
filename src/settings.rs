@@ -44,6 +44,13 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
+/// SquirrelDisk-AI fork: default OpenAI-compatible endpoint and model. The
+/// default is z.ai's coding-plan endpoint, which accepts a coding-plan
+/// `ZAI_API_KEY` (the pay-as-you-go endpoint `…/api/paas/v4/…` rejects it
+/// with "insufficient balance").
+pub const AI_ENDPOINT_DEFAULT: &str = "https://api.z.ai/api/coding/paas/v4/chat/completions";
+pub const AI_MODEL_DEFAULT: &str = "glm-5.3";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -72,6 +79,10 @@ pub struct Settings {
     pub folder_menu: bool,
     /// The `squirreldisk` command was set up (or tried) at first launch.
     pub cli_offered: bool,
+    /// SquirrelDisk-AI fork: OpenAI-compatible chat endpoint for advice.
+    pub ai_endpoint: String,
+    pub ai_model: String,
+    pub ai_api_key: String,
 }
 
 impl Default for Settings {
@@ -95,6 +106,9 @@ impl Default for Settings {
             sponsor_measurement: true,
             folder_menu: false,
             cli_offered: false,
+            ai_endpoint: AI_ENDPOINT_DEFAULT.into(),
+            ai_model: AI_MODEL_DEFAULT.into(),
+            ai_api_key: String::new(),
         }
     }
 }

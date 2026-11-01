@@ -8,7 +8,6 @@ use crate::i18n::{tr, tr_phase, tr_reason, trf};
 use crate::safety::Verdict;
 use crate::sound::Sfx;
 use crate::tree::fmt_size;
-use crate::update::State as UpState;
 use eframe::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 use std::f32::consts::TAU;
 use std::sync::atomic::Ordering;
@@ -286,7 +285,7 @@ impl App {
         let mut new_theme: Option<String> = None;
         let mut s = self.settings.clone();
         let upd = self.updater.state();
-        let mut check_now = false;
+        let _ = &upd;
         let gl_error = self.gl_error.clone();
         let mut picker = self.lang_picker;
         let mut lang_btn = Rect::NOTHING;
@@ -378,9 +377,7 @@ impl App {
                         0 => &mut s.sound,
                         1 => &mut s.shader_fx,
                         2 => &mut s.watch_fs,
-                        3 => &mut s.auto_update,
                         4 => &mut s.personalized_sponsors,
-                    6 => &mut s.auto_install,
                         _ => &mut s.sponsor_measurement,
                     };
                     widgets::toggle(ui, tgl, Id::new(("set-toggle", k)), v, &theme);
@@ -401,6 +398,40 @@ impl App {
                 let sr = Rect::from_min_size(Pos2::new(x0 + w - 200.0, y + 8.0), Vec2::new(200.0, 28.0));
                 widgets::stepper(ui, sr, Id::new("rings"), &mut s.rings, 3, 9, &theme);
                 y += 50.0;
+
+                // SquirrelDisk-AI fork: the AI advice provider
+                {
+                    let p = ui.painter();
+                    p.text(Pos2::new(x0, y), Align2::LEFT_TOP, tr("AI ADVICE"), bold(11.0), theme.text_faint);
+                    y += 22.0;
+                    let edits: [(&str, &str, u8); 3] = [
+                        (tr("API key"), tr("Stored locally, sent only to the endpoint below"), 0),
+                        (tr("Endpoint"), tr("Any OpenAI-compatible chat completions URL"), 1),
+                        (tr("Model"), tr("e.g. glm-5.3"), 2),
+                    ];
+                    for (label, sub, k) in edits {
+                        let p = ui.painter();
+                        p.text(Pos2::new(x0, y + 12.0), Align2::LEFT_CENTER, label, bold(13.5), theme.text);
+                        p.text(Pos2::new(x0, y + 30.0), Align2::LEFT_CENTER, sub, font(11.5), theme.text_dim);
+                        let er = Rect::from_min_size(Pos2::new(x0 + w - 260.0, y + 6.0), Vec2::new(260.0, 32.0));
+                        let mut te = egui::TextEdit::singleline(match k {
+                            0 => &mut s.ai_api_key,
+                            1 => &mut s.ai_endpoint,
+                            _ => &mut s.ai_model,
+                        })
+                        .desired_width(er.width());
+                        if k == 0 {
+                            te = te.password(true);
+                        }
+                        ui.put(er, te);
+                        y += 46.0;
+                    }
+                    let note = tr("Nothing is sent until you click Ask or Analyze; then folder names and sizes of the scanned folder go to this endpoint. File contents are never read.");
+                    let g = ui.painter().layout(note.to_string(), font(11.0), theme.text_faint, w);
+                    let gh = g.size().y;
+                    ui.painter().galley(Pos2::new(x0, y + 2.0), g, theme.text_faint);
+                    y += gh + 14.0;
+                }
 
                 // system integration: the folder menu and the terminal command
                 let folder_menu = if cfg!(target_os = "macos") {
@@ -480,25 +511,14 @@ impl App {
             let y = card.bottom() - 62.0;
             let p = ui.painter();
             p.line_segment([Pos2::new(x0, y), Pos2::new(x0 + w, y)], Stroke::new(1.0, with_alpha(theme.stroke, 0.7)));
-            let status = match &upd {
-                UpState::Idle => "".to_string(),
-                UpState::Checking => tr("Checking…").to_string(),
-                UpState::UpToDate => tr("You're up to date").to_string(),
-                UpState::Available(r) => trf("Version {version} is available", &[("version", &r.version)]),
-                UpState::Downloading => tr("Downloading update…").to_string(),
-                UpState::Ready(v) => trf("{version} is ready — restart to update", &[("version", v)]),
-                UpState::Failed(e) => trf("Update check failed: {error}", &[("error", e)]),
-            };
-            let mut line = format!("SquirrelDisk {}  ·  {}", env!("CARGO_PKG_VERSION"), status);
+            // SquirrelDisk-AI fork: self-update is disabled (DECISIONS.md,
+            // DEC-AI-004); the footer says so instead of offering updates.
+            let mut line = format!("SquirrelDisk-AI {} · fork of SquirrelDisk · self-update off", env!("CARGO_PKG_VERSION"));
             if let Some(e) = &gl_error {
                 line = format!("{line}  ·  {}", trf("CPU renderer ({reason})", &[("reason", e)]));
             }
-            // the button grows with its (translated) label
-            let bw = (p.layout_no_wrap(tr("Check for updates").to_string(), bold(13.0), theme.text).size().x + 52.0).clamp(160.0, w * 0.55);
-            let line = widgets::truncate(p, &line, &font(12.0), w - bw - 12.0);
+            let line = widgets::truncate(p, &line, &font(12.0), w);
             p.text(Pos2::new(x0, y + 26.0), Align2::LEFT_CENTER, line, font(12.0), theme.text_dim);
-            let b = Rect::from_min_size(Pos2::new(x0 + w - bw, y + 10.0), Vec2::new(bw, 32.0));
-            check_now = widgets::button(ui, b, Id::new("check-upd"), tr("Check for updates"), Some(Icon::Refresh), BtnStyle::Subtle, &theme).clicked();
             if picker {
                 // grid of languages drawn over the settings card
                 let cols = 3;
@@ -545,9 +565,6 @@ impl App {
                 }
             }
         });
-        if check_now {
-            self.updater.check(ctx.clone());
-        }
         if picker != self.lang_picker {
             // native names need every script's font while the picker is open
             crate::ui::app::install_fonts(ctx, crate::i18n::current(), picker);

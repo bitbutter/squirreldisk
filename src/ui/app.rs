@@ -82,6 +82,8 @@ pub struct Session {
     /// scripts found in them (see [`crate::i18n::scripts_of`]).
     pub names_checked: usize,
     pub name_scripts: u32,
+    /// SquirrelDisk-AI fork: the AI advice panel state (side panel, AI tab).
+    pub ai: crate::ai::AiPanel,
 }
 
 impl Session {
@@ -130,6 +132,7 @@ impl Session {
             free_at: Instant::now() - Duration::from_secs(60),
             names_checked: 0,
             name_scripts: 0,
+            ai: crate::ai::AiPanel::default(),
         }
     }
 
@@ -456,6 +459,11 @@ pub fn install_fonts(ctx: &egui::Context, lang: &str, all_scripts: bool) {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut settings = Settings::load();
+        // SquirrelDisk-AI fork: never self-update. An upstream release binary
+        // would overwrite this fork executable and silently remove the AI
+        // integration (see DECISIONS.md, DEC-AI-004).
+        settings.auto_update = false;
+        settings.auto_install = false;
         if let Ok(style) = std::env::var("SQUIRRELDISK_CHART") {
             settings.chart_style = style;
         }
@@ -700,27 +708,11 @@ impl App {
 
     /// Keeps the app current: checks every 6 hours and, if allowed, downloads
     /// new versions in the background so a restart is all that's needed.
-    fn auto_update(&mut self, ctx: &egui::Context) {
-        if scan::demo::enabled() {
-            return;
-        }
-        use crate::update::State;
-        let state = self.updater.state();
-        if self.settings.auto_update
-            && self.update_checked.elapsed() > Duration::from_secs(3600)
-            && matches!(state, State::Idle | State::UpToDate | State::Failed(_))
-        {
-            self.update_checked = Instant::now();
-            self.updater.check(ctx.clone());
-        }
-        if self.settings.auto_install {
-            if let State::Available(r) = &state {
-                if r.asset_url.is_some() {
-                    self.updater.install(r.clone(), ctx.clone());
-                }
-            }
-        }
-        self.offer_update(&state);
+    fn auto_update(&mut self, _ctx: &egui::Context) {
+        // SquirrelDisk-AI fork: self-update is disabled entirely; upstream
+        // binaries would replace this fork (DECISIONS.md, DEC-AI-004). The
+        // updater stays Idle forever, so no update prompt ever opens.
+        let _ = (&self.updater, _ctx);
     }
 
     /// Opens the update window for a version that is installed and waits for
@@ -828,6 +820,18 @@ impl App {
                 } else {
                     // A finished scan speaks for itself: no toast, just the (optional) sound.
                     sounds.push(Sfx::Success);
+                    // SquirrelDisk-AI fork: local pattern pass over the finished
+                    // scan → teaser for the AI panel. Purely local, no network
+                    // (DEC-AI-003): the LLM is only called on an explicit click.
+                    {
+                        let t = s.tree.read().unwrap();
+                        s.ai.teaser = crate::ai::teaser(&t);
+                    }
+                    s.ai.teaser_seen = false;
+                    if s.ai.teaser.as_ref().is_some_and(|x| x.total >= 1_000_000_000 || x.count >= 8) {
+                        let sum: String = s.ai.teaser.as_ref().map(|x| crate::tree::fmt_size(x.total)).unwrap_or_default();
+                        toasts.push((format!("{} · {} in known caches — see the AI tab", s.title, sum), self.theme.accent));
+                    }
                     if s.source().is_local() {
                         interest_jobs.push(s.tree.clone());
                     }

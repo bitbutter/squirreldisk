@@ -4,6 +4,7 @@
 #![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
 mod agent;
+mod ai;
 mod cli;
 mod delete;
 #[cfg(unix)]

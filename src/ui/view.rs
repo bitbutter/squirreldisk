@@ -526,11 +526,11 @@ impl App {
 
     fn panel_ui(&mut self, ui: &mut Ui, panel: Rect, si: usize) {
         let theme = self.theme.clone();
-        {
-            let p = ui.painter();
-            widgets::shadow(p, panel, 18.0, 0.5, &theme);
-            p.rect_filled(panel, cr(12.0), with_alpha(theme.surface, if theme.dark { 0.72 } else { 0.9 }));
-            p.rect_stroke(panel, cr(12.0), Stroke::new(1.0, with_alpha(theme.stroke, 0.6)), egui::StrokeKind::Inside);
+        super::ai_panel::frame(ui, panel, &theme);
+        super::ai_panel::tabs(self, ui, panel, si);
+        if self.sessions[si].ai.open {
+            self.ai_panel_body(ui, panel, si);
+            return;
         }
         let treemap_mode = self.settings.chart_style == "treemap";
         let s = &self.sessions[si];
@@ -548,7 +548,8 @@ impl App {
         let total = sunburst::view_size(&t, pv).max(1);
         let title = if pv.node == t.root && pv.skip == 0 { s.title.clone() } else { view_label(&t, pv) };
         let files = t.get(pv.node).files;
-        let inner = panel.shrink2(Vec2::new(18.0, 16.0));
+        // SquirrelDisk-AI fork: 26px lower for the FILES/AI tab strip.
+        let inner = Rect::from_min_max(Pos2::new(panel.left() + 18.0, panel.top() + 16.0 + 26.0), Pos2::new(panel.right() - 18.0, panel.bottom() - 16.0));
 
         // header
         let p = ui.painter().clone();
