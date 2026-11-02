@@ -688,6 +688,21 @@ impl App {
         if self.placing == u8::MAX {
             return;
         }
+        // SquirrelDisk-AI: launch paths that go through UAC (the "runas"
+        // admin shortcut) often leave the new window BEHIND the consent
+        // dialog's owner — pull it to the foreground on the first frames.
+        #[cfg(windows)]
+        if (3..=12).contains(&self.placing) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, FindWindowW, SetForegroundWindow};
+            let title: Vec<u16> = "SquirrelDisk ".encode_utf16().collect();
+            let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+            if hwnd as usize != 0 {
+                unsafe {
+                    let _ = SetForegroundWindow(hwnd);
+                    let _ = BringWindowToTop(hwnd);
+                }
+            }
+        }
         self.placing = self.placing.saturating_add(1);
         ctx.request_repaint();
         match on_active_screen(frame) {
