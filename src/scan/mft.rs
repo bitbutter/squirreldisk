@@ -190,9 +190,10 @@ impl MftLayout {
         let mut rec = AlignedBuf::new(record_bytes as usize);
         vol.read_at(mft_lcn * sectors_per_cluster, &mut rec).ok()?;
         let fixed = fixed_up(rec.bytes(), bytes_per_sector as usize)?;
-        let attrs = walk_attributes(&fixed)?;
+        let mut attrs = [AttrView::default(); MAX_ATTRS];
+        let n = walk_attributes_buf(&fixed, &mut attrs)?;
         let mut runs = Vec::new();
-        for att in attrs {
+        for att in attrs.into_iter().take(n) {
             if att.type_ == 0x80 && att.name_len == 0 && att.nonresident {
                 if let Some(r) = parse_dataruns(&fixed, att.run_off) {
                     runs = r;
@@ -208,39 +209,52 @@ impl MftLayout {
     }
 }
 
-/// Copies a record out and applies the update-sequence fixups. Every
-/// sector-sized block of a record ends in the USN tag; the original tail
-/// bytes live in the header array. `None` = not a record / corrupt.
+/// Applies the update-sequence fixups in place. Every sector-sized block of
+/// a record ends in the USN tag; the original tail bytes live in the header
+/// array. `false` = not a record / corrupt. Hot path: no allocation.
+fn apply_fixups_inplace(rec: &mut [u8], sector: usize) -> bool {
+    if rec.len() < 0x30 || rec.len() % sector != 0 || sector < 512 {
+        return false;
+    }
+    if &rec[0..4] != b"FILE" {
+        return false;
+    }
+    let usa_off = u16at(rec, 4) as usize;
+    let usa_count = u16at(rec, 6) as usize;
+    if usa_count == 0 || usa_off + usa_count * 2 > rec.len() {
+        return false;
+    }
+    let tag = u16at(rec, usa_off);
+    for i in 1..usa_count {
+        let end = i * sector;
+        if end > rec.len() {
+            break;
+        }
+        let at = end - 2;
+        if u16at(rec, at) != tag {
+            return false; // wrong USN tag: record is corrupt
+        }
+        let fix = u16at(rec, usa_off + i * 2);
+        rec[at] = (fix & 0xFF) as u8;
+        rec[at + 1] = (fix >> 8) as u8;
+    }
+    true
+}
+
+/// Test/boot-sector helper: fixed-up copy of one record.
 fn fixed_up(rec: &[u8], sector: usize) -> Option<Vec<u8>> {
     if rec.len() < 0x30 || rec.len() % sector != 0 || sector < 512 {
         return None;
     }
     let mut out = rec.to_vec();
-    if &out[0..4] != b"FILE" {
-        return None;
+    if apply_fixups_inplace(&mut out, sector) {
+        Some(out)
+    } else {
+        None
     }
-    let usa_off = u16at(&out, 4) as usize;
-    let usa_count = u16at(&out, 6) as usize;
-    if usa_count == 0 || usa_off + usa_count * 2 > out.len() {
-        return None;
-    }
-    let tag = u16at(&out, usa_off);
-    for i in 1..usa_count {
-        let end = i * sector;
-        if end > out.len() {
-            break;
-        }
-        let at = end - 2;
-        if u16at(&out, at) != tag {
-            return None; // wrong USN tag: record is corrupt
-        }
-        let fix = u16at(&out, usa_off + i * 2);
-        out[at] = (fix & 0xFF) as u8;
-        out[at + 1] = (fix >> 8) as u8;
-    }
-    Some(out)
 }
 
+#[derive(Clone, Copy, Default)]
 struct AttrView {
     type_: u32,
     nonresident: bool,
@@ -258,14 +272,18 @@ struct AttrView {
     lowest_vcn: u64,
 }
 
-/// Walks the attribute chain of one fixed-up record.
-fn walk_attributes(rec: &[u8]) -> Option<Vec<AttrView>> {
+/// Most records carry <= 4 attributes; 8 covers the rest without heap.
+const MAX_ATTRS: usize = 8;
+
+/// Walks the attribute chain of one fixed-up record into `out`; returns the
+/// count. No allocation.
+fn walk_attributes_buf(rec: &[u8], out: &mut [AttrView; MAX_ATTRS]) -> Option<usize> {
     let first = u16at(rec, 0x14) as usize;
     let used = u32at(rec, 0x18) as usize;
     if first < 0x30 || first >= rec.len() || used == 0 || used > rec.len() {
         return None;
     }
-    let mut out = Vec::new();
+    let mut cnt = 0usize;
     let mut off = first;
     loop {
         if off + 0x10 > used {
@@ -297,10 +315,14 @@ fn walk_attributes(rec: &[u8]) -> Option<Vec<AttrView>> {
             let co = u16at(rec, off + 0x14) as usize + off;
             AttrView { type_, nonresident, name_len, content_off: co, content_len: cl, run_off: 0, alloc_size: cl as u64, real_size: cl as u64, lowest_vcn: 0 }
         };
-        out.push(view);
+        if cnt == MAX_ATTRS {
+            break; // pathological record: extra attributes ignored
+        }
+        out[cnt] = view;
+        cnt += 1;
         off += len;
     }
-    Some(out)
+    Some(cnt)
 }
 
 /// MFT dataruns at `start`: (lcn, clusters). LCNs are signed-relative.
@@ -353,8 +375,11 @@ fn parse_dataruns(rec: &[u8], start: usize) -> Option<Vec<(u64, u64)>> {
 // ---------------------------------------------------------------------------
 // Parsed record
 
-struct Parsed {
-    name: String,
+/// Parsed record borrowing the record buffer: the name stays an undecoded
+/// UTF-16 span, so small files (folded away, name never stored) never pay
+/// for a String allocation.
+struct ParsedRef<'a> {
+    name_bytes: &'a [u8],
     parent: u64,
     is_dir: bool,
     reparse: bool,
@@ -369,25 +394,44 @@ struct Parsed {
     data_owner: bool,
 }
 
+/// Owned form for tests and one-off callers.
+struct Parsed {
+    name: String,
+    parent: u64,
+    is_dir: bool,
+    reparse: bool,
+    size: u64,
+    mtime: u64,
+    base: u64,
+    data_owner: bool,
+}
+
+/// Decodes a UTF-16LE name span.
+fn decode_name(b: &[u8]) -> String {
+    let units: Vec<u16> = b.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
 /// Parses one fixed-up record. Names: a record can carry several `$FILE_NAME`
 /// attributes (hard links, DOS aliases); the best-namespace name wins and the
-/// record is counted exactly once. Sizes: unnamed `$DATA` (resident or real
-/// size of non-resident); directories fall back to `$FILE_NAME` sizes (0).
-fn parse_record(rec: &[u8]) -> Option<Parsed> {
+/// record is counted exactly once. Sizes: unnamed `$DATA` (allocated for
+/// non-resident); directories fall back to `$FILE_NAME` sizes (0).
+fn parse_record_buf<'a>(rec: &'a [u8], attrs: &mut [AttrView; MAX_ATTRS]) -> Option<ParsedRef<'a>> {
     let flags = u16at(rec, 0x16);
     if flags & 0x0001 == 0 {
         return None; // free record
     }
     let base = u64at(rec, 0x20) & FRN_MASK;
     let is_dir = flags & 0x0002 != 0;
-    let attrs = walk_attributes(rec)?;
+    let n = walk_attributes_buf(rec, attrs)?;
     let mut reparse = false;
     let mut si_mtime = 0u64;
     // namespace rank: 3 = Win32+DOS → 4, 1 = Win32 → 3, 0 = POSIX → 2, 2 = DOS-only → 1
-    let mut best: Option<(u8, String, u64, u64, u64)> = None;
+    // (rank, name span start, name span len, parent, mtime, size)
+    let mut best: Option<(u8, usize, usize, u64, u64, u64)> = None;
     let mut data_size: Option<u64> = None;
     let mut data_owner = false;
-    for att in &attrs {
+    for att in attrs.iter().take(n) {
         match att.type_ {
             0x10 => {
                 if !att.nonresident && att.content_len >= 0x20 {
@@ -415,15 +459,14 @@ fn parse_record(rec: &[u8]) -> Option<Parsed> {
                     0 => 2,
                     _ => 1,
                 };
-                let better = best.as_ref().map(|(r, ..)| *r < rank).unwrap_or(true);
+                let better = best.map(|(r, ..)| r < rank).unwrap_or(true);
                 if better {
-                    let units: Vec<u16> = (0..nl).map(|k| u16::from_le_bytes([c[0x3C + k * 2], c[0x3C + k * 2 + 1]])).collect();
-                    let name = String::from_utf16_lossy(&units);
                     let mtime = filetime_to_unix(u64at(c, 0x10));
                     // $FILE_NAME sizes are directory-entry-time values;
                     // allocated is the disk-usage truth, real the fallback
                     let fn_size = if alloc > 0 { alloc } else { real };
-                    best = Some((rank, name, parent, mtime, fn_size));
+                    let start = att.content_off + 0x3C;
+                    best = Some((rank, start, nl * 2, parent, mtime, fn_size));
                 }
             }
             0x80 => {
@@ -446,13 +489,28 @@ fn parse_record(rec: &[u8]) -> Option<Parsed> {
     }
     // extension records carry attribute instances, not names — they still
     // matter (their $DATA belongs to a base record), so parse them nameless
-    let (name, parent, fn_mtime, fn_real) = match best {
-        Some((_, n, p, m, s)) => (n, p, m, s),
-        None if base != 0 => (String::new(), 0, 0, 0),
+    let (name_bytes, parent, fn_mtime, fn_real) = match best {
+        Some((_, start, len, p, m, sz)) => (rec.get(start..start + len)?, p, m, sz),
+        None if base != 0 => (&[][..], 0, 0, 0),
         None => return None,
     };
     let mtime = if si_mtime > 0 { si_mtime } else { fn_mtime };
-    Some(Parsed { name, parent, is_dir, reparse, size: data_size.unwrap_or(fn_real), mtime, base, data_owner })
+    Some(ParsedRef { name_bytes, parent, is_dir, reparse, size: data_size.unwrap_or(fn_real), mtime, base, data_owner })
+}
+
+/// Owned-parse adapter (tests, one-off callers): decodes the name span.
+fn parse_record(rec: &[u8]) -> Option<Parsed> {
+    let mut attrs = [AttrView::default(); MAX_ATTRS];
+    parse_record_buf(rec, &mut attrs).map(|p| Parsed {
+        name: decode_name(p.name_bytes),
+        parent: p.parent,
+        is_dir: p.is_dir,
+        reparse: p.reparse,
+        size: p.size,
+        mtime: p.mtime,
+        base: p.base,
+        data_owner: p.data_owner,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +587,48 @@ impl Staged {
     }
 }
 
+/// Hot-path staging on ref-parsed records: small files never decode a name.
+fn stage_ref(dirs: &mut HashMap<u64, Staged>, ext: &mut HashMap<u64, u64>, frn: u64, p: ParsedRef, limits: &ScanLimits) {
+    if p.base != 0 {
+        // extension record: only a VCN-0 unnamed $DATA instance may carry
+        // size home, and never more than once per base record
+        if p.data_owner && p.size > 0 {
+            let e = ext.entry(p.base).or_insert(0);
+            *e = (*e).max(p.size);
+        }
+        return;
+    }
+    if p.reparse {
+        if p.is_dir {
+            let d = dirs.entry(p.parent).or_insert_with(|| Staged::new(p.parent));
+            if d.mounts.len() < 64 {
+                d.mounts.push(decode_name(p.name_bytes));
+            }
+        }
+        // reparse FILES (symlinks) are skipped, as the walker skips links
+        return;
+    }
+    if p.is_dir {
+        let e = dirs.entry(frn).or_insert_with(|| Staged::new(p.parent));
+        if e.name.is_empty() {
+            e.name = decode_name(p.name_bytes);
+            e.parent = p.parent;
+            e.mtime = p.mtime;
+        }
+        return;
+    }
+    if p.size >= limits.keep_min {
+        dirs.entry(p.parent).or_insert_with(|| Staged::new(p.parent)).add_file(frn, decode_name(p.name_bytes), p.size, p.mtime, limits);
+    } else {
+        // small file: folded into the aggregate — the name is never stored,
+        // so it is never decoded
+        let d = dirs.entry(p.parent).or_insert_with(|| Staged::new(p.parent));
+        d.small_size = d.small_size.saturating_add(p.size);
+        d.small_count += 1;
+    }
+}
+
+/// Owned staging (tests).
 fn stage(dirs: &mut HashMap<u64, Staged>, ext: &mut HashMap<u64, u64>, frn: u64, p: Parsed, limits: &ScanLimits) {
     if p.base != 0 {
         // extension record: only a VCN-0 unnamed $DATA instance may carry
@@ -565,6 +665,20 @@ fn stage(dirs: &mut HashMap<u64, Staged>, ext: &mut HashMap<u64, u64>, frn: u64,
 // ---------------------------------------------------------------------------
 // The scan
 
+/// True when the volume handle exists but elevation is missing: the scan
+/// will silently use the directory walker unless the app is relaunched
+/// elevated. Surfaces as a UI hint (Progress::hint).
+pub fn needs_admin(drive: &str) -> bool {
+    let Some(letter) = drive.trim_end_matches(':').chars().next().map(|c| c.to_ascii_uppercase()) else { return false };
+    if !letter.is_ascii_alphabetic() {
+        return false;
+    }
+    match std::fs::File::open(format!(r"\.\{letter}:")) {
+        Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+        _ => false,
+    }
+}
+
 /// Runs an MFT scan of `drive` into `tree` (root = volume root). Returns
 /// `false` when this engine cannot run (no elevation / not NTFS / no MFT) —
 /// the caller then uses the directory walker.
@@ -590,73 +704,205 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     progress.set_status("Reading NTFS master file table");
     progress.expected.store(lay.total_bytes, Ordering::Relaxed);
 
-    let mut dirs: HashMap<u64, Staged> = HashMap::new();
-    // $DATA found in extension records, folded back into base records
-    let mut ext: HashMap<u64, u64> = HashMap::new();
+    // Per-thread staging maps: every thread parses its slice of each chunk
+    // into its own maps, merged once after the read loop. Record numbers are
+    // absolute MFT stream positions / record size, so threads stay consistent.
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
+    let est_dirs = ((lay.total_bytes / lay.record_bytes) / 16) as usize;
+    let mut tdirs: Vec<HashMap<u64, Staged>> = (0..threads).map(|_| HashMap::with_capacity((est_dirs / threads).max(1024))).collect();
+    let mut texts: Vec<HashMap<u64, u64>> = (0..threads).map(|_| HashMap::new()).collect();
+    let mut tlive: Vec<u64> = vec![0; threads];
 
-    // Stream the MFT in ~64 MB chunks. Records can straddle chunk reads when
-    // cluster_bytes is not a multiple of record_bytes (512 B clusters), so a
-    // carry of the trailing partial record moves to the next chunk.
+    // Record-aligned chunk plan; records straddling a run boundary (possible
+    // only when a cluster is smaller than a record) are skipped by keeping
+    // every read on the absolute record grid.
     let record = lay.record_bytes as usize;
-    let chunk = 64 << 20;
-    let mut buf = AlignedBuf::new(chunk + record);
-    let mut carry: Vec<u8> = Vec::new();
-    let mut seen_bytes = 0u64;
-    let mut records = 0u64;
-    let mut staged_files_total = 0u64;
-
-    'runs: for &(lcn, clusters) in &lay.runs {
+    let chunk: u64 = 64 << 20;
+    let mut plan: Vec<(u64, u64, u64)> = Vec::new(); // (lba, bytes, record_base)
+    let mut stream_pos: u64 = 0;
+    for &(lcn, clusters) in &lay.runs {
         let run_bytes = clusters.saturating_mul(lay.cluster_bytes);
         let run_lba = lcn * lay.cluster_bytes / lay.bytes_per_sector;
-        let mut done: u64 = 0;
+        let misalign = stream_pos % lay.record_bytes;
+        let mut done = if misalign != 0 { lay.record_bytes - misalign } else { 0 };
+        done = done.min(run_bytes);
+        stream_pos += done;
         while done < run_bytes {
-            if progress.cancelled() {
-                return true; // partial tree stays; the caller handles cancel
+            let mut want = (run_bytes - done).min(chunk);
+            want -= want % lay.record_bytes; // whole records only
+            if want == 0 {
+                break; // sub-record tail: skipped by the grid realignment
             }
-            let want = (run_bytes - done).min(chunk as u64);
-            let sectors = (want + lay.bytes_per_sector - 1) / lay.bytes_per_sector;
-            let read_bytes = sectors * lay.bytes_per_sector;
-            buf.set_len(read_bytes as usize);
-            if vol.read_at(run_lba + done / lay.bytes_per_sector, &mut buf).is_err() {
-                restore(&progress);
-                return false;
-            }
-            let b = buf.bytes();
-            let mut stream: Vec<u8> = std::mem::take(&mut carry);
-            stream.extend_from_slice(b);
-            let usable = stream.len() - stream.len() % record;
-            let whole = usable / record;
-            let mut in_use = 0u64;
-            for i in 0..whole {
-                let s = i * record;
-                if let Some(fixed) = fixed_up(&stream[s..s + record], lay.bytes_per_sector as usize) {
-                    let live = u16at(&fixed, 0x16) & 1 != 0;
-                    match parse_record(&fixed) {
-                        Some(p) => {
-                            in_use += 1;
-                            stage(&mut dirs, &mut ext, records + i as u64, p, &limits);
-                        }
-                        None if live => {
-                            progress.errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                        None => {}
-                    }
-                }
-            }
-            records += whole as u64;
-            staged_files_total += in_use;
-            carry = stream.split_off(usable);
-            carry.shrink_to_fit();
-            done += read_bytes;
-            seen_bytes = (seen_bytes + read_bytes).min(lay.total_bytes);
-            progress.bytes.store(seen_bytes, Ordering::Relaxed);
-            progress.files.store(staged_files_total, Ordering::Relaxed);
+            plan.push((run_lba + done / lay.bytes_per_sector, want, stream_pos / lay.record_bytes));
+            stream_pos += want;
+            done += want;
         }
+        stream_pos += run_bytes - done;
+    }
+    let total_bytes = lay.total_bytes;
+
+    // Reader thread streams chunks ahead of the parse threads (ping-pong
+    // buffers): read of chunk N+1 overlaps the parallel parse of chunk N,
+    // so the whole pass costs ~max(I/O, parse) instead of their sum.
+    let read_failed: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let fail_flag = read_failed.clone();
+    let (tx, rx): (std::sync::mpsc::Sender<AlignedBuf>, std::sync::mpsc::Receiver<AlignedBuf>) = std::sync::mpsc::channel();
+    let (tx_back, rx_back): (std::sync::mpsc::Sender<AlignedBuf>, std::sync::mpsc::Receiver<AlignedBuf>) = std::sync::mpsc::channel();
+    let p_for_reader = progress.clone();
+    let plan_for_reader = plan.clone();
+    let reader = std::thread::spawn(move || {
+        let mut bufs = vec![AlignedBuf::new(chunk as usize), AlignedBuf::new(chunk as usize)];
+        'plan: for &(lba, want, _base) in &plan_for_reader {
+            if p_for_reader.cancelled() {
+                break 'plan;
+            }
+            let mut buf = match bufs.pop() {
+                Some(b) => b,
+                None => match rx_back.recv() {
+                    Ok(b) => b,
+                    Err(_) => break 'plan,
+                },
+            };
+            buf.set_len(want as usize);
+            if vol.read_at(lba, &mut buf).is_err() {
+                let mut f = fail_flag.lock().unwrap();
+                if f.is_none() {
+                    *f = Some("volume read failed".into());
+                }
+                break 'plan;
+            }
+            if tx.send(buf).is_err() {
+                break 'plan;
+            }
+        }
+        // end-of-stream (or failure): main's recv() unblocks with None
+        drop(tx);
+    });
+
+    let mut seen_bytes = 0u64;
+    let mut plan_idx = 0usize;
+    while let Ok(mut buf) = rx.recv() {
+        if progress.cancelled() {
+            break;
+        }
+        let want = buf.len() as u64;
+        // absolute record numbers come from the plan (skipped tails are
+        // already accounted there); seen_bytes alone would drift
+        let record_base = plan.get(plan_idx).map(|&(_, _, rb)| rb).unwrap_or(seen_bytes / lay.record_bytes);
+        plan_idx += 1;
+        let b = buf.bytes();
+        {
+            let n = b.len() / record;
+            let slice = (n / threads).max(1) * record;
+            std::thread::scope(|sc| {
+                let it = tdirs.iter_mut().zip(texts.iter_mut()).zip(tlive.iter_mut());
+                for (t, ((dirs_t, ext_t), live_t)) in it.enumerate() {
+                    let start = t * slice;
+                    if start >= b.len() {
+                        break;
+                    }
+                    let end = if t + 1 == threads || (t + 1) * slice >= b.len() { b.len() } else { (t + 1) * slice };
+                    let base = record_base + (start / record) as u64;
+                    let b_t: &[u8] = &b[start..end];
+                    let sector = lay.bytes_per_sector as usize;
+                    let limits = &limits;
+                    let progress = &progress;
+                    sc.spawn(move || {
+                        let mut scratch = vec![0u8; record];
+                        let mut attrs = [AttrView::default(); MAX_ATTRS];
+                        for (i, off) in (0..b_t.len()).step_by(record).enumerate() {
+                            let hdr = &b_t[off..off + record];
+                            // fast reject before any copy: magic + in-use
+                            if &hdr[..4] != b"FILE" {
+                                continue;
+                            }
+                            if hdr[0x16] & 1 == 0 {
+                                continue; // free record: no fixups, no parse
+                            }
+                            scratch.copy_from_slice(hdr);
+                            if !apply_fixups_inplace(&mut scratch, sector) {
+                                continue;
+                            }
+                            match parse_record_buf(&scratch, &mut attrs) {
+                                Some(p) => {
+                                    *live_t += 1;
+                                    stage_ref(dirs_t, ext_t, base + i as u64, p, limits);
+                                }
+                                None => {
+                                    // free records never reach here (rejected
+                                    // before the copy): a live record that
+                                    // fails to parse is an error
+                                    progress.errors.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        seen_bytes = (seen_bytes + want).min(total_bytes);
+        progress.bytes.store(seen_bytes, Ordering::Relaxed);
+        progress.files.store(tlive.iter().sum::<u64>(), Ordering::Relaxed);
+        if tx_back.send(buf).is_err() {
+            break;
+        }
+    }
+    drop(tx_back);
+    let _ = reader.join();
+    if let Some(err) = read_failed.lock().unwrap().take() {
+        let _ = err;
+        restore(&progress);
+        return false;
     }
 
     if progress.cancelled() {
         return true;
     }
+
+    // merge the per-thread staging maps
+    let mut dirs: HashMap<u64, Staged> = tdirs.swap_remove(0);
+    for other in tdirs {
+        for (frn, st) in other {
+            use std::collections::hash_map::Entry;
+            match dirs.entry(frn) {
+                Entry::Occupied(mut e) => {
+                    let dst = e.get_mut();
+                    if dst.name.is_empty() && !st.name.is_empty() {
+                        dst.name = st.name;
+                        dst.parent = st.parent;
+                        dst.mtime = st.mtime;
+                    }
+                    for (f, n, sz, m) in st.files {
+                        dst.add_file(f, n, sz, m, &limits);
+                    }
+                    if let Some((h, _)) = st.heap {
+                        use std::cmp::Reverse;
+                        for Reverse((sz, f, n, m)) in h {
+                            dst.add_file(f, n, sz, m, &limits);
+                        }
+                    }
+                    dst.small_size = dst.small_size.saturating_add(st.small_size);
+                    dst.small_count = dst.small_count.saturating_add(st.small_count);
+                    for m in st.mounts {
+                        if dst.mounts.len() < 64 {
+                            dst.mounts.push(m);
+                        }
+                    }
+                }
+                Entry::Vacant(e) => {
+                    e.insert(st);
+                }
+            }
+        }
+    }
+    let mut ext: HashMap<u64, u64> = texts.swap_remove(0);
+    for other in texts {
+        for (k, v) in other {
+            let e = ext.entry(k).or_insert(0);
+            *e = (*e).max(v);
+        }
+    }
+
     if !dirs.get(&ROOT_FRN).is_some_and(|d| d.named()) {
         restore(&progress);
         return false; // no usable root: wrong parse — let the walker do it
@@ -793,6 +1039,52 @@ mod tests {
         assert!(fixed_up(&bad, 512).is_none());
     }
 
+
+    /// Perf probe (no admin needed): parse throughput on synthetic records.
+    /// Run: cargo test --release --no-default-features bench_parse -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf probe"]
+    fn bench_parse_throughput() {
+        let record = 1024usize;
+        let n = 96 * 1024; // 96 MB of records
+        let mut data = vec![0u8; n * record];
+        for i in 0..n {
+            // spread files over 4000 parent dirs, half small (folded), half big
+            let parent = 5 + (i % 4000) as u64;
+            let big = i % 2 == 0;
+            let rec = synth_record(false, parent, "file-name.bin", Some(if big { 900_000 } else { 900 }));
+            data[i * record..(i + 1) * record].copy_from_slice(&rec);
+        }
+        let limits = ScanLimits { keep_min: 32 * 1024, max_files_per_dir: 48 };
+        let mut dirs: HashMap<u64, Staged> = HashMap::with_capacity(8192);
+        let mut ext: HashMap<u64, u64> = HashMap::new();
+        let t0 = std::time::Instant::now();
+        let mut scratch = vec![0u8; record];
+        let mut attrs = [AttrView::default(); MAX_ATTRS];
+        let mut live = 0u64;
+        for i in 0..n {
+            let s = i * record;
+            if &data[s..s + 4] != b"FILE" || data[s + 0x16] & 1 == 0 {
+                continue;
+            }
+            scratch.copy_from_slice(&data[s..s + record]);
+            if !apply_fixups_inplace(&mut scratch, 512) {
+                continue;
+            }
+            if let Some(p) = parse_record_buf(&scratch, &mut attrs) {
+                live += 1;
+                stage_ref(&mut dirs, &mut ext, i as u64, p, &limits);
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let mb = (n * record) as f64 / 1e6;
+        eprintln!(
+            "MFT parse: {} records ({:.0} MB) in {:.2}s = {:.0} MB/s single-thread, {:.0}k records/s, live={}",
+            n, mb, secs, mb / secs, n as f64 / secs / 1000.0, live
+        );
+        assert!(live > n as u64 * 9 / 10, "synthetic records must parse");
+    }
+
     #[test]
     fn filetime() {
         assert_eq!(filetime_to_unix(0), 0);
@@ -813,11 +1105,19 @@ mod tests {
         assert_eq!(runs, vec![(100, 8), (110, 4)]);
     }
 
-    /// Builds one synthetic fixed-up-free record (1024 B, no fixups).
+    /// Builds one synthetic record with a valid fixup array (1024 B,
+    /// 2 sectors: tag at 510/1022 replaced from the header array).
     fn synth_record(dir: bool, parent: u64, name: &str, data: Option<u64>) -> Vec<u8> {
         let mut rec = vec![0u8; 1024];
         rec[..4].copy_from_slice(b"FILE");
-        rec[0x14..0x16].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[4..6].copy_from_slice(&0x28u16.to_le_bytes()); // usa offset
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes()); // tag + 2 entries
+        rec[0x28..0x2A].copy_from_slice(&0xAABBu16.to_le_bytes()); // tag
+        rec[0x2A..0x2C].copy_from_slice(&0x1111u16.to_le_bytes()); // sec 1 tail
+        rec[0x2C..0x2E].copy_from_slice(&0x2222u16.to_le_bytes()); // sec 2 tail
+        rec[510..512].copy_from_slice(&0xAABBu16.to_le_bytes());
+        rec[1022..1024].copy_from_slice(&0xAABBu16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x30u16.to_le_bytes()); // first attr
         rec[0x18..0x1C].copy_from_slice(&1024u32.to_le_bytes());
         rec[0x16..0x18].copy_from_slice(&if dir { 0x0003u16 } else { 0x0001u16 }.to_le_bytes());
         // $STANDARD_INFORMATION @0x30 (48+0x18 content), mtime 2024-01-01

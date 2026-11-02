@@ -329,6 +329,9 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             if volume_root && cfg!(windows) {
                 let drive = root.to_string_lossy();
                 let drive = drive.chars().next().unwrap_or_default().to_string();
+                if crate::scan::mft::needs_admin(&drive) {
+                    p.hint.lock().unwrap().replace("Fast NTFS scan needs administrator — Settings → Relaunch as administrator".into());
+                }
                 // a corrupt/adversarial MFT must degrade to the walker, not
                 // take the scan thread down (run() itself avoids panics on
                 // disk-controlled values; this is the belt to its braces)
@@ -362,7 +365,8 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
                     }
                 }
             }
-            p.set_status(format!("Scanned in {:.1}s", started.elapsed().as_secs_f32()));
+            let engine = if mft_done { "NTFS master file table" } else { "directories" };
+            p.set_status(format!("Scanned in {:.1}s · {}", started.elapsed().as_secs_f32(), engine));
             p.done.store(true, Ordering::Relaxed);
         })
         .expect("spawn scan thread");

@@ -27,6 +27,8 @@ pub struct Progress {
     pub status: Mutex<String>,
     /// Directories currently being listed, with the time listing started.
     pub inflight: Mutex<Vec<(usize, String, std::time::Instant)>>,
+    /// One-shot UI hint from a scan thread (e.g. "MFT needs admin").
+    pub hint: Mutex<Option<String>>,
 }
 
 impl Progress {

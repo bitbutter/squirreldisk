@@ -282,6 +282,7 @@ impl App {
         let theme = self.theme.clone();
         let themes = self.themes.clone();
         let mut close = false;
+        let mut relaunch = false;
         let mut new_theme: Option<String> = None;
         let mut s = self.settings.clone();
         let gl_error = self.gl_error.clone();
@@ -416,6 +417,21 @@ impl App {
                     let gh = g.size().y;
                     ui.painter().galley(Pos2::new(x0, y + 2.0), g, theme.text_faint);
                     y += gh + 14.0;
+                }
+
+                // SquirrelDisk-AI fork: fast scans need the NTFS volume handle
+                {
+                    let p = ui.painter();
+                    p.text(Pos2::new(x0, y), Align2::LEFT_TOP, tr("FAST SCANS"), bold(11.0), theme.text_faint);
+                    y += 22.0;
+                    let p = ui.painter();
+                    p.text(Pos2::new(x0, y + 12.0), Align2::LEFT_CENTER, tr("Scan NTFS volumes via the master file table"), bold(13.5), theme.text);
+                    p.text(Pos2::new(x0, y + 30.0), Align2::LEFT_CENTER, tr("Whole-volume scans read the NTFS master file table in seconds instead of walking directories — needs the app to run as administrator"), font(11.5), theme.text_dim);
+                    let b = Rect::from_min_size(Pos2::new(x0 + w - 200.0, y + 6.0), Vec2::new(200.0, 32.0));
+                    if widgets::button(ui, b, Id::new("relaunch-admin"), tr("Relaunch as administrator"), None, BtnStyle::Subtle, &theme).clicked() {
+                        relaunch = true;
+                    }
+                    y += 46.0;
                 }
 
                 // system integration: the folder menu and the terminal command
@@ -591,6 +607,11 @@ impl App {
         self.settings = s;
         if changed {
             self.settings.save();
+        }
+        if relaunch {
+            // UAC prompt, then this instance exits; the scan state is
+            // rebuilt by the elevated instance on the next volume scan
+            super::integration::relaunch_elevated();
         }
         if close || bd { None } else { Some(Modal::Settings) }
     }

@@ -383,3 +383,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 }
+
+/// Relaunches the app elevated (UAC prompt) and exits the current instance.
+/// Used by Settings so volume scans can use the NTFS master-file-table engine.
+#[cfg(windows)]
+pub fn relaunch_elevated() -> ! {
+    use std::os::windows::ffi::OsStrExt;
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("squirreldisk.exe"));
+    let verb: Vec<u16> = std::ffi::OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let dir: Vec<u16> = exe.parent().map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()).unwrap_or_default();
+    unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            if dir.is_empty() { std::ptr::null() } else { dir.as_ptr() },
+            1, // SW_SHOWNORMAL
+        );
+    }
+    std::process::exit(0)
+}
+
+#[cfg(not(windows))]
+pub fn relaunch_elevated() -> ! {
+    std::process::exit(0)
+}

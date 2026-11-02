@@ -785,6 +785,10 @@ impl App {
         let mut auth_needed: Option<(String, String)> = None;
         let watch_enabled = self.settings.watch_fs;
         for s in self.sessions.iter_mut() {
+            // one-shot hints from scan threads (e.g. MFT needs admin)
+            if let Some(hint) = s.progress.hint.lock().unwrap().take() {
+                toasts.push((hint, self.theme.warn));
+            }
             // scan finished?
             if !s.was_done && s.progress.is_done() {
                 s.was_done = true;
