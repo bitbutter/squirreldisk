@@ -284,8 +284,6 @@ impl App {
         let mut close = false;
         let mut new_theme: Option<String> = None;
         let mut s = self.settings.clone();
-        let upd = self.updater.state();
-        let _ = &upd;
         let gl_error = self.gl_error.clone();
         let mut picker = self.lang_picker;
         let mut lang_btn = Rect::NOTHING;

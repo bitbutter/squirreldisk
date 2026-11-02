@@ -807,6 +807,19 @@ impl App {
                         s.ai.teaser = crate::ai::teaser(&t);
                     }
                     s.ai.teaser_seen = false;
+                    // a rescan replaced the tree: the old dossier, triage and
+                    // chat describe files that may not exist anymore — start
+                    // the conversation over (the tab stays open)
+                    if s.ai.analyzed || s.ai.phase != crate::ai::Phase::Idle {
+                        s.ai.dossier.clear();
+                        s.ai.history.clear();
+                        s.ai.triage = None;
+                        s.ai.analyzed = false;
+                        s.ai.follow_ups.clear();
+                        s.ai.error = None;
+                        s.ai.link_cache.clear();
+                        s.ai.phase = crate::ai::Phase::Idle;
+                    }
                     if !self.settings.ai_api_key.trim().is_empty() && !s.ai.manual_files {
                         s.ai.open = true;
                         s.ai.teaser_seen = true;

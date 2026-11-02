@@ -305,10 +305,7 @@ mod tests {
                 include_str!("ui/modals.rs"),
                 include_str!("ui/cloud.rs"),
                 include_str!("ui/fx.rs"),
-                include_str!("ui/ads.rs"),
                 include_str!("ui/app.rs"),
-                include_str!("sponsor/mod.rs"),
-                include_str!("sponsor/interests.rs"),
                 include_str!("i18n.rs"),
             ]
             .join("\n");

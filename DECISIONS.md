@@ -18,7 +18,7 @@ Context: Until the first click, a scan is entirely local; outbound traffic carry
 
 DEC-AI-004: The fork never self-updates. `auto_update`/`auto_install` are forced off at load, the periodic check is disabled, and Settings shows no update controls. Upstream release binaries would overwrite the fork executable and silently remove the AI integration.
 
-DEC-AI-005: The default endpoint is z.ai's coding-plan OpenAI-compatible endpoint (`…/api/coding/paas/v4/chat/completions`), because the pay-as-you-go endpoint rejects coding-plan keys with "insufficient balance". Any OpenAI-compatible URL works via Settings.
+DEC-AI-005: The default endpoint is z.ai's coding-plan OpenAI-compatible endpoint (`…/api/coding/paas/v4/chat/completions`), because the pay-as-you-go endpoint rejects coding-plan keys with "insufficient balance". Any OpenAI-compatible URL works via Settings. The API key is stored in cleartext in `settings.json` in the app's config folder (same as every other local tool on this machine); it is masked in the UI and never appears in toasts, errors or logs.
 
 DEC-AI-006: Tier affordance tracks provenance. SAFE items (pattern-matched or clearly regenerable) get a bulk "Collect all" into the staging basket; VERIFY items (model judgment) get per-item review; YOUR CALL items get information only, no collect button.
 
@@ -29,10 +29,23 @@ DEC-AI-008: Every path the AI panel shows is a navigation link. Path text in tri
 
 DEC-AI-009: The fork carries no advertising or sponsor surface: the sponsor module, banner widget, on-device interest matching and its daily view-count reporting are removed, and Settings has no toggles for them. After this removal the only outbound request the app ever makes on its own is none — the AI endpoint is contacted solely on an explicit click (see DEC-AI-003).
 
+## SCAN
+
+DEC-SCAN-001: Whole-volume NTFS scans on Windows go through a Master File Table reader (`src/scan/mft.rs`): boot sector → `$MFT` dataruns → sequential record stream. It engages only for volume-root scans of NTFS drives; everything else (subfolders, remote, non-elevated, unreadable MFT, any parse refusal) uses the upstream directory walker. The MFT engine must leave the tree untouched and restore progress semantics on every fallback path.
+
+Context: WizTree-style speed — one sequential read of the MFT replaces per-file enumeration and stat calls. Reading `\.\C:` needs an elevated process; the fallback makes elevation optional, not required.
+
+DEC-SCAN-002: The MFT engine treats disk contents as untrusted input. No offset, length or size read from a record may index memory without a bounds check. Pre-assembly failures (open, parse, unreadable MFT run) fall back to the directory walker with the tree untouched and progress semantics restored; a caught panic during assembly fails the scan with an error message instead — the tree may be half-assembled and the walker would double-count on top of it.
+
+DEC-SCAN-003: File sizes are allocated sizes (non-resident `$DATA` allocated, `$FILE_NAME` allocated as fallback), matching the directory walker; hardlinked files count once per MFT record (one name, the best-namespace one), unlike the walker which keeps every directory entry but zeroes repeats' sizes; reparse points are mounts when directories, skipped when files; cancelling during the MFT read yields an empty tree (the user cancelled; nothing is assembled mid-stream).
+
+Context: the per-record hardlink rule is deliberate — it is the file's real occupancy attributed once.
+
+DEC-SCAN-004: The fork targets Windows only. Cross-platform code from upstream is left in place where harmless; no effort is spent keeping other targets building.
+
 ## Open
 
-- File age (mtime) is not in the tree; the dossier has no age signal. Adding `mtime` to `Node` would make "old and big" triage much stronger.
 - Scan snapshots + diff ("where did my space go since last month") — computed locally, LLM narrates.
 - Duplicate-finder results could feed the dossier when a dupes run exists for the same tree.
 - Streaming replies (SSE) instead of blocking wait with a spinner.
-- The update window is untouched upstream code and can no longer open (updater state stays Idle).
+- The update window is untouched upstream code and can no longer open (updater state stays Idle, reachable only through the `SQD_UPDATE` debug env hook).

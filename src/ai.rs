@@ -34,14 +34,9 @@ const JUNK_NAMES: &[&str] = &[
     ".nuget",
     ".terraform",
     "DerivedData",
-    "build",
-    "dist",
-    "out",
     "coverage",
     ".parcel-cache",
     ".turbo",
-    "tmp",
-    "temp",
     ".venv",
     "venv",
     "Code Cache",
@@ -82,18 +77,21 @@ pub fn teaser(tree: &Tree) -> Option<Teaser> {
     let mut hits: HashMap<String, (usize, u64)> = HashMap::new();
     let mut total = 0u64;
     let mut count = 0usize;
-    let mut stack = vec![tree.root];
-    while let Some(id) = stack.pop() {
+    // (node, inside_junk): a junk dir inside a junk dir is already counted
+    // by its parent — do not descend into matched subtrees
+    let mut stack = vec![(tree.root, false)];
+    while let Some((id, in_junk)) = stack.pop() {
         for c in tree.children(id) {
             let n = tree.get(c);
-            stack.push(c);
-            if n.kind == Kind::Dir && junk_match(tree, c) {
+            let hit = !in_junk && n.kind == Kind::Dir && junk_match(tree, c);
+            if hit {
                 let e = hits.entry(n.name.to_string()).or_insert((0, 0));
                 e.0 += 1;
                 e.1 += n.size;
                 total += n.size;
                 count += 1;
             }
+            stack.push((c, in_junk || hit));
         }
     }
     if hits.is_empty() {
@@ -109,7 +107,8 @@ pub fn teaser(tree: &Tree) -> Option<Teaser> {
 // Dossier: what the model is allowed to see
 
 /// Compact, pre-aggregated view of a scan. Never a raw tree dump: the tree
-/// skeleton is depth-2 top-8 with `<rest>` folding, plus rollups the model
+/// skeleton is 3 levels, top-6 (12 at the root) with `<rest>` folding and a
+/// hard 500-line budget, plus rollups the model
 /// could not compute itself (same-name dirs, file types, cache matches).
 pub fn dossier(tree: &Tree, free: Option<u64>) -> String {
     let mut out = String::new();
@@ -117,16 +116,11 @@ pub fn dossier(tree: &Tree, free: Option<u64>) -> String {
     let n = tree.get(root);
     let _ = writeln!(out, "SCAN: {} · {} total · {} files · free: {}", tree.root_path, fmt_size(n.size), fmt_count(n.files as u64), free.map(fmt_size).unwrap_or_else(|| "unknown".into()));
 
-    let _ = writeln!(out, "\nTREE (2 levels, top 8 per folder, … = rest):");
-    subtree(&mut out, tree, root, 0, 8, 12, "");
-    let mut top_kids = tree.sorted_children(root);
-    top_kids.truncate(4);
-    for c in top_kids {
-        if tree.can_enter(c) && tree.get(c).size > 0 {
-            let _ = writeln!(out);
-            subtree(&mut out, tree, c, 0, 8, 8, "");
-        }
-    }
+    let _ = writeln!(out, "\nTREE (3 levels, top 6 per folder / 12 at the root, … = rest of each folder):");
+    // three levels from the root, top-N per folder with `<rest>` folding,
+    // hard-capped at ~500 lines (DEC-AI-001: a dossier, never a dump)
+    let mut budget: usize = 500;
+    subtree(&mut out, tree, root, 0, 6, 12, "", &mut budget);
 
     // caches
     if let Some(t) = teaser(tree) {
@@ -189,11 +183,18 @@ pub fn dossier(tree: &Tree, free: Option<u64>) -> String {
     out
 }
 
-fn subtree(out: &mut String, t: &Tree, id: u32, depth: usize, top: usize, root_top: usize, prefix: &str) {
+fn subtree(out: &mut String, t: &Tree, id: u32, depth: usize, top: usize, root_top: usize, prefix: &str, budget: &mut usize) {
     let n = t.get(id);
     let cap = if depth == 0 { root_top } else { top };
+    let pad_here = "  ".repeat(depth + 1);
+    if *budget == 0 {
+        let _ = writeln!(out, "{pad_here}… (listing truncated)");
+        return;
+    }
     let mut kids = t.sorted_children(id);
-    let rest = if kids.len() > cap { kids.split_off(cap) } else { Vec::new() };
+    let shown_cap = cap.min(*budget);
+    let rest: Vec<u32> = if kids.len() > shown_cap { kids.split_off(shown_cap) } else { Vec::new() };
+    *budget -= kids.len();
     let total = n.size.max(1);
     let pad = "  ".repeat(depth + 1);
     for c in kids {
@@ -209,7 +210,9 @@ fn subtree(out: &mut String, t: &Tree, id: u32, depth: usize, top: usize, root_t
         let _ = writeln!(out, "{pad}{} {:>3}% {}{}", fmt_size(k.size), pct, label, denied);
         if depth < 2 && t.can_enter(c) && k.size > 0 && k.kind == Kind::Dir {
             let next = format!("{prefix}{}/", k.name);
-            subtree(out, t, c, depth + 1, top, root_top, &next);
+            // recursion enters even at budget 0: the callee then prints one
+            // '(listing truncated)' marker and returns — bounded, honest
+            subtree(out, t, c, depth + 1, top, root_top, &next, budget);
         }
     }
     if !rest.is_empty() {
@@ -228,25 +231,59 @@ pub fn resolve_path(t: &Tree, p: &str) -> (u32, bool) {
     if p.is_empty() || p == "/" || p == "\\" {
         return (NONE, false);
     }
-    let norm = p.replace('\\', "/").trim_end_matches('/').to_lowercase();
-    // drop a scan-root prefix if present
-    let root = t.root_path.replace('\\', "/").trim_end_matches('/').to_lowercase();
-    let rel = norm.strip_prefix(&root).map(|r| r.trim_start_matches('/')).unwrap_or(&norm);
-    if rel.is_empty() {
+    let raw = p.replace('\\', "/").trim_end_matches('/').to_string();
+    let root: String = t.root_path.replace('\\', "/").trim_end_matches('/').to_string();
+    // strip a root prefix only on a path boundary: `C:/x` must not eat the
+    // front of `C:/xy` (remainder must be empty or start with '/')
+    let raw_rel = strip_root(&raw, &root).unwrap_or_else(|| raw.clone());
+    if raw_rel.is_empty() {
         return (NONE, false); // the scan root itself is never a suggestion
     }
-    // walk from the root, component by component, case-insensitively
-    let mut cur = t.root;
-    for comp in rel.split('/').filter(|c| !c.is_empty()) {
-        match t.children(cur).find(|&c| t.get(c).name.as_ref() == comp) {
-            Some(c) => cur = c,
-            None => match t.children(cur).find(|&c| t.get(c).name.to_lowercase() == comp) {
-                Some(c) => cur = c,
-                None => return (cur, false),
-            },
+    // pass 1: exact case (the model echoes dossier paths verbatim)
+    if let Some(id) = walk(t, t.root, raw_rel.split('/').filter(|c| !c.is_empty()), false) {
+        return (id, true);
+    }
+    // pass 2: recased input — the first case-insensitive hit wins
+    let lower_rel = raw_rel.to_lowercase();
+    let root_l = root.to_lowercase();
+    let lower_rel = strip_root(&lower_rel, &root_l).unwrap_or(lower_rel.clone());
+    // case-insensitive fallback: the first sibling hit wins (fork targets
+    // Windows/NTFS, where names are case-insensitive anyway)
+    if let Some(id) = walk(t, t.root, lower_rel.split('/').filter(|c| !c.is_empty()), true) {
+        return (id, true);
+    }
+    (NONE, false)
+}
+
+/// Strips `root` from `p` when what follows is a path boundary.
+fn strip_root(p: &str, root: &str) -> Option<String> {
+    let rest = p.strip_prefix(root)?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    if let Some(tail) = rest.strip_prefix('/') {
+        return Some(tail.trim_start_matches('/').to_string());
+    }
+    // volume roots end in ':' (`C:`): `C:Users` means `C:/Users` there
+    if root.ends_with(':') && !rest.starts_with('/') {
+        return Some(rest.trim_start_matches('/').to_string());
+    }
+    None
+}
+
+/// Walks components from `at`; `ci` = case-insensitive comparison.
+fn walk<'a, I: Iterator<Item = &'a str>>(t: &Tree, mut at: u32, comps: I, ci: bool) -> Option<u32> {
+    for comp in comps {
+        let hit = t.children(at).find(|&c| {
+            let n = t.get(c).name.as_ref();
+            if ci { n.to_lowercase() == comp } else { n == comp }
+        });
+        match hit {
+            Some(c) => at = c,
+            None => return None,
         }
     }
-    (cur, true)
+    Some(at)
 }
 
 /// A depth-2 top-10 listing of one folder, for follow-up "expand" requests.
@@ -257,7 +294,8 @@ pub fn expansion_of(tree: &Tree, path: &str) -> Option<String> {
     }
     let rel = tree.rel_components(id).join("/");
     let mut out = format!("EXPANSION of {} ({}):\n", if rel.is_empty() { "(scan root)" } else { &rel }, fmt_size(tree.get(id).size));
-    subtree(&mut out, tree, id, 0, 8, 10, "");
+    let mut budget: usize = 200;
+    subtree(&mut out, tree, id, 0, 8, 10, "", &mut budget);
     Some(out)
 }
 
@@ -398,7 +436,7 @@ pub fn spawn_chat(endpoint: &str, key: &str, model: &str, messages: &[Msg], temp
         "model": model,
         "messages": messages.iter().map(|m| json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     });
     let url = endpoint.to_string();
     let key = key.to_string();
@@ -417,8 +455,11 @@ pub fn spawn_chat(endpoint: &str, key: &str, model: &str, messages: &[Msg], temp
                 .header("Content-Type", "application/json")
                 .send_json(&body)
                 .map_err(|e| format!("{e}"))?;
+            // ureq's read_to_string caps the body at 10 MB by default: a
+            // misconfigured endpoint cannot OOM the app
             let text = resp.body_mut().read_to_string().map_err(|e| format!("{e}"))?;
-            let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| format!("not JSON: {}", &text[..text.len().min(300)]))?;
+            let snippet: String = text.chars().take(300).collect();
+            let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| format!("not JSON: {snippet}"))?;
             if let Some(e) = v.get("error") {
                 let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("API error");
                 return Err(msg.to_string());
@@ -470,6 +511,11 @@ pub struct AiPanel {
     /// The user deliberately switched back to the FILES tab: stop
     /// auto-opening the AI tab when scans finish.
     pub manual_files: bool,
+    /// Focus the chat input at the next frame (after a send or reply).
+    pub refocus: bool,
+    /// (message index, line index) → resolved node for chat path links.
+    /// History is append-only, so indices are stable; invalidated on rescan.
+    pub link_cache: std::collections::HashMap<(usize, usize), Option<u32>>,
 }
 
 impl Default for AiPanel {
@@ -490,6 +536,8 @@ impl Default for AiPanel {
             verify_open: false,
             jump: false,
             manual_files: false,
+            refocus: false,
+            link_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -525,6 +573,47 @@ mod tests {
         assert!(d.contains("node_modules"), "{d}");
         assert!(d.contains(".bin"), "extension rollup missing: {d}");
         assert!(d.contains("free"), "{d}");
+    }
+
+    #[test]
+    fn resolve_path_boundary_and_regressions() {
+        let t = tree();
+        // round-2 critical: a root prefix must not eat a longer sibling name.
+        // `C:/xa` discriminates: the buggy strip turned it into `a` (a real
+        // child) and resolved; the guard must refuse and resolve nothing.
+        assert_eq!(resolve_path(&t, "C:/xa").1, false, "C:/xa must not resolve to child a");
+        assert_eq!(resolve_path(&t, "C:/xy").1, false);
+        assert_eq!(resolve_path(&t, "C:/x/a").1, true);
+        // recased paths resolve through the lowercase pass
+        let (id, ok) = resolve_path(&t, "A/NODE_MODULES");
+        assert!(ok, "recased path resolves");
+        assert_eq!(t.get(id).name.as_ref(), "node_modules");
+        // the scan root itself is never a suggestion
+        assert_eq!(resolve_path(&t, "C:/x").1, false);
+        assert_eq!(resolve_path(&t, "").1, false);
+    }
+
+    #[test]
+    fn dossier_is_budget_capped_and_folds_rest() {
+        // 3-level tree: 30 root dirs (root cap 12 -> 18 folded), each with 6
+        // subdirs, each with 6 leaves. Uncapped TREE output would be
+        // 12 + 12*6 + 12*6*6 = 516 leaf+mid lines > the 500 budget, so the
+        // budget must bite and the truncation marker must appear.
+        let mut t = Tree::new("C:/w", "w", Source::Local);
+        for d in 0..30 {
+            let dir = t.add_child(0, &format!("d{d:02}"), Kind::Dir, 0, 0);
+            for s1 in 0..6 {
+                let sub = t.add_child(dir, &format!("s{s1}"), Kind::Dir, 0, 0);
+                for f in 0..6 {
+                    t.add_child_sized(sub, &format!("f{f:02}.bin"), Kind::File, 1000 + f as u64, 1);
+                }
+            }
+        }
+        let d = dossier(&t, None);
+        let lines = d.lines().count();
+        assert!(lines <= 620, "dossier too long: {lines}");
+        assert!(d.contains("(18 more)"), "root rest-fold missing (30 dirs vs cap 12)");
+        assert!(d.contains("listing truncated"), "budget exhaustion must be visible to the model");
     }
 
     #[test]

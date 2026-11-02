@@ -32,11 +32,13 @@ pub fn tabs(app: &mut App, ui: &mut egui::Ui, panel: Rect, si: usize) {
     let p = ui.painter().clone();
     p.line_segment([strip.left_bottom(), strip.right_bottom()], Stroke::new(1.0, with_alpha(theme.stroke, 0.6)));
     let mut clicked: Option<bool> = None;
+    let mut next_x = strip.left() + 18.0;
     for (k, (label, is_ai)) in [("FILES", false), ("AI", true)].into_iter().enumerate() {
         let active = is_ai == app.sessions[si].ai.open;
         let g = p.layout_no_wrap(label.to_string(), bold(10.5), Color32::WHITE);
         let w = g.size().x + 18.0;
-        let r = Rect::from_min_size(Pos2::new(strip.left() + 18.0 + k as f32 * 46.0, strip.center().y - 9.0), Vec2::new(w, 18.0));
+        let r = Rect::from_min_size(Pos2::new(next_x, strip.center().y - 9.0), Vec2::new(w, 18.0));
+        next_x = r.right() + 6.0;
         let resp = ui.interact(r, Id::new(("panel-tab", k)), Sense::click());
         let col = if active { theme.text } else if resp.hovered() { theme.text_dim } else { theme.text_faint };
         p.text(Pos2::new(r.left(), r.center().y), Align2::LEFT_CENTER, label, bold(10.5), col);
@@ -54,7 +56,7 @@ pub fn tabs(app: &mut App, ui: &mut egui::Ui, panel: Rect, si: usize) {
     {
         let s = &mut app.sessions[si];
         if !s.ai.open && s.ai.teaser.is_some() && !s.ai.teaser_seen {
-            p.circle_filled(Pos2::new(strip.left() + 18.0 + 46.0 + 26.0, strip.center().y), 3.5, theme.warn);
+            p.circle_filled(Pos2::new(next_x - 6.0, strip.center().y), 3.5, theme.warn);
         }
         match clicked {
             Some(true) => {
@@ -69,6 +71,11 @@ pub fn tabs(app: &mut App, ui: &mut egui::Ui, panel: Rect, si: usize) {
             None => {}
         }
     }
+}
+
+/// (resolved bytes, unresolved count) for a tier's header line.
+fn tier_stats(items: &[PanelItemView]) -> (u64, usize) {
+    items.iter().fold((0u64, 0usize), |(b, u), i| if i.node.is_some() { (b + i.size, u) } else { (b, u + 1) })
 }
 
 /// One suggestion row, resolved against the live tree.
@@ -199,6 +206,10 @@ impl App {
                                 s.ai.follow_ups = t.expand.clone();
                                 s.ai.triage = Some(t);
                             }
+                            // the raw reply is always kept: it is the model's
+                            // turn in the conversation and the prose fallback
+                            // when the JSON did not parse (DEC-AI-007)
+                            s.ai.history.push(ai::assistant(reply));
                             // the triage answer reads from the top: no jump
                         } else {
                             let (text, expand) = ai::take_expand_request(&reply);
@@ -209,6 +220,7 @@ impl App {
                             s.ai.jump = true;
                         }
                         s.ai.phase = Phase::Done;
+                        s.ai.refocus = true;
                     }
                     Err(e) => {
                         s.ai.error = Some(e);
@@ -297,7 +309,7 @@ impl App {
                             if widgets::button_ex(inner, b, Id::new(("ai-analyze", si)), tr("Analyze this scan"), None, BtnStyle::Primary, &theme, !scanning).clicked() {
                                 a.action = Some(0);
                             }
-                            let host = self.settings.ai_endpoint.trim_start_matches("https://").split('/').next().unwrap_or("").to_string();
+                            let host = self.settings.ai_endpoint.split("://").nth(1).unwrap_or(&self.settings.ai_endpoint).split('/').next().unwrap_or("").to_string();
                             let note = format!("{} · {} {}", self.settings.ai_model, tr("sends folder names and sizes to"), host);
                             let g = p.layout(note, font(10.5), theme.text_faint, w);
                             let gh = g.size().y;
@@ -339,8 +351,9 @@ impl App {
                                 y += 22.0;
                             }
                             if !safe.is_empty() {
-                                let safe_bytes: u64 = safe.iter().map(|i| i.size).sum();
-                                let (h, clicked) = self.ai_tier_header(inner, left, right, y, tr("SAFE"), theme.ok, safe.len(), safe_bytes, Some(tr("Collect all")), &theme, si, 0);
+                                let (safe_bytes, unresolved) = tier_stats(&safe);
+                                let label = if unresolved > 0 { format!("{} · {} not in scan", tr("Collect all"), unresolved) } else { tr("Collect all").to_string() };
+                                let (h, clicked) = self.ai_tier_header(inner, left, right, y, tr("SAFE"), theme.ok, safe.len(), safe_bytes, Some(&label), &theme, si, 0);
                                 if clicked {
                                     a.collect.extend(safe.iter().filter_map(|i| i.node));
                                 }
@@ -350,9 +363,9 @@ impl App {
                                 }
                             }
                             if !verify.is_empty() {
-                                let verify_bytes: u64 = verify.iter().map(|i| i.size).sum();
-                                let label = if verify_open { tr("Hide") } else { tr("Review") };
-                                let (h, clicked) = self.ai_tier_header(inner, left, right, y, tr("VERIFY"), theme.warn, verify.len(), verify_bytes, Some(label), &theme, si, 1);
+                                let (verify_bytes, _unresolved) = tier_stats(&verify);
+                                let label = if verify_open { tr("Hide").to_string() } else { tr("Review").to_string() };
+                                let (h, clicked) = self.ai_tier_header(inner, left, right, y, tr("VERIFY"), theme.warn, verify.len(), verify_bytes, Some(&label), &theme, si, 1);
                                 if clicked {
                                     a.action = Some(5);
                                 }
@@ -430,7 +443,7 @@ impl App {
                         // chat history (skip [0]=dossier; [1] is rendered above when it parsed as triage)
                         let skip_first_reply = self.sessions[si].ai.triage.is_some();
                         let start = 1 + skip_first_reply as usize;
-                        for m in history.iter().skip(start) {
+                        for (mi, m) in history.iter().enumerate().skip(start) {
                             if m.role == "user" {
                                 let g = p.layout(format!("{} {}", tr("you:"), m.content), font(12.0), theme.accent2, w - 8.0);
                                 let gh = g.size().y;
@@ -440,12 +453,12 @@ impl App {
                                 // assistant text, line by line: a line that
                                 // names a real path is clickable and zooms
                                 // the sunburst to it (DEC-AI-008)
-                                for line in m.content.lines() {
+                                for (li, line) in m.content.lines().enumerate() {
                                     let g = p.layout(line.to_string(), font(12.0), theme.text, w - 12.0);
                                     let gh = g.size().y.max(14.0);
                                     let rr = Rect::from_min_size(Pos2::new(left + 2.0, y), Vec2::new(w - 4.0, gh));
-                                    let node = self.ai_path_in_line(si, line);
-                                    let id = Id::new(("ai-line", si, y as u32, line.len()));
+                                    let node = self.ai_cached_path(si, mi, li, line);
+                                    let id = Id::new(("ai-line", si, mi, li));
                                     let resp = inner.interact(rr, id, if node.is_some() { Sense::click() } else { Sense::hover() });
                                     let hov = resp.hovered() && node.is_some();
                                     if hov {
@@ -454,7 +467,7 @@ impl App {
                                     }
                                     p.galley(Pos2::new(left + 10.0, y), g, theme.text);
                                     if resp.clicked() {
-                                        if let Some((_, n)) = node {
+                                        if let Some(n) = node {
                                             a.navigate = Some(n);
                                         }
                                     }
@@ -474,19 +487,27 @@ impl App {
                     });
             });
 
-            // input row (pinned below the scroll area)
-            let can_send = !busy && !self.sessions[si].ai.input.trim().is_empty();
+            // input row (pinned below the scroll area); chat needs the
+            // dossier in context — gate on a completed Analyze
+            let can_send = !busy && self.sessions[si].ai.analyzed && !self.sessions[si].ai.input.trim().is_empty();
+            let want_focus = self.sessions[si].ai.refocus && !busy;
+            let analyzed = self.sessions[si].ai.analyzed;
             let resp = ui.put(
                 input,
                 egui::TextEdit::singleline(&mut self.sessions[si].ai.input)
-                    .hint_text(tr("Ask about this scan…").to_owned())
+                    .hint_text(if analyzed { tr("Ask about this scan…").to_owned() } else { tr("Analyze first, then ask…").to_owned() })
                     .desired_width(input.width()),
             );
             if widgets::button_ex(ui, send_r, Id::new(("ai-send", si)), "→", Some(Icon::Forward), BtnStyle::Primary, &theme, can_send).clicked() {
                 a.action = Some(1);
             }
+            if want_focus {
+                resp.request_focus();
+                self.sessions[si].ai.refocus = false;
+            }
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_send {
                 a.action = Some(1);
+                self.sessions[si].ai.refocus = true;
             }
         }
 
@@ -494,7 +515,12 @@ impl App {
         match a.action {
             Some(0) => self.ai_analyze(si, &ctx),
             Some(1) => self.ai_send_chat(si, &ctx),
-            Some(2) => self.ai_call(si, ai::chat_system_prompt(), 0.3, &ctx),
+            Some(2) => {
+                // retry the call that failed: analyze while no first reply
+                // has landed, chat afterwards
+                let system = if self.sessions[si].ai.analyzed { ai::chat_system_prompt() } else { ai::analyze_system_prompt() };
+                self.ai_call(si, system, 0.3, &ctx);
+            }
             Some(3) => self.open_modal(Modal::Settings),
             Some(4) => self.ai_send_expansions(si, &ctx),
             Some(5) => self.sessions[si].ai.verify_open = !self.sessions[si].ai.verify_open,
@@ -506,7 +532,7 @@ impl App {
                 self.bin_bounce = 1.0;
             }
         }
-        if let Some(n) = a.navigate {
+        if let Some(n) = a.navigate.filter(|&n| self.sessions[si].tree.read().unwrap().is_alive(n)) {
             self.sessions[si].navigate(View::node(n));
             self.sfx(crate::sound::Sfx::Blip);
         }
@@ -514,6 +540,18 @@ impl App {
             ctx.copy_text(c);
             self.toasts.push(tr("Copied").into(), self.theme.accent);
         }
+    }
+
+    /// Cached `ai_path_in_line`: history is append-only, so (message, line)
+    /// indices are stable and each line resolves against the tree exactly once.
+    fn ai_cached_path(&mut self, si: usize, mi: usize, li: usize, line: &str) -> Option<u32> {
+        let key = (mi, li);
+        if let Some(hit) = self.sessions[si].ai.link_cache.get(&key) {
+            return *hit;
+        }
+        let node = self.ai_path_in_line(si, line).map(|(_, n)| n);
+        self.sessions[si].ai.link_cache.insert(key, node);
+        node
     }
 
     /// If `line` names exactly one path that exists in the scan, return it
@@ -606,14 +644,18 @@ impl App {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 p.line_segment([Pos2::new(lr.left() + 1.0, lr.bottom() - 3.0), Pos2::new(lr.left() + pw + 4.0, lr.bottom() - 3.0)], Stroke::new(1.0, theme.accent));
             }
-            p.text(Pos2::new(left + 10.0, y + 8.0), Align2::LEFT_CENTER, path_line, mono, if hov { theme.text } else { theme.text });
+            p.text(Pos2::new(left + 10.0, y + 8.0), Align2::LEFT_CENTER, path_line, mono, if hov { theme.accent2 } else { theme.text });
             if resp.clicked() {
                 if let Some(node) = it.node {
                     a.navigate = Some(node);
                 }
             }
             p.text(Pos2::new(right - 36.0, y + 8.0), Align2::RIGHT_CENTER, fmt_size(it.size), bold(11.0), theme.text_dim);
-            if it.collected {
+            if tier == 'y' {
+                // YOUR CALL: information only — the model cannot stage what
+                // only the user can judge (DECISIONS.md, DEC-AI-006)
+                p.text(Pos2::new(right - 4.0, y + 8.0), Align2::RIGHT_CENTER, "?", font(11.0), theme.text_faint);
+            } else if it.collected {
                 widgets::draw_icon(&p, Icon::Check, Rect::from_center_size(Pos2::new(right - 20.0, y + 8.0), Vec2::splat(13.0)), theme.ok);
             } else {
                 let b = Rect::from_center_size(Pos2::new(right - 20.0, y + 8.0), Vec2::splat(22.0));

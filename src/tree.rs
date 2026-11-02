@@ -49,6 +49,9 @@ pub struct Node {
     pub next_sibling: u32,
     pub kind: Kind,
     pub flags: u8,
+    /// Modification time, unix seconds; 0 = unknown (walker scans of
+    /// subfolders leave it 0; MFT volume scans fill it in).
+    pub mtime: u64,
 }
 
 impl Node {
@@ -96,6 +99,7 @@ impl Tree {
             next_sibling: NONE,
             kind: Kind::Dir,
             flags: 0,
+            mtime: 0,
         };
         Tree {
             nodes: vec![root],
@@ -116,6 +120,13 @@ impl Tree {
     #[inline]
     pub fn get_mut(&mut self, id: u32) -> &mut Node {
         &mut self.nodes[id as usize]
+    }
+
+    /// Sets a node's modification time (unix seconds).
+    pub fn set_mtime(&mut self, id: u32, secs: u64) {
+        if let Some(n) = self.nodes.get_mut(id as usize) {
+            n.mtime = secs;
+        }
     }
 
     pub fn is_alive(&self, id: u32) -> bool {
@@ -147,6 +158,7 @@ impl Tree {
             next_sibling: next,
             kind,
             flags: 0,
+            mtime: 0,
         });
         self.get_mut(parent).first_child = id;
         self.version += 1;

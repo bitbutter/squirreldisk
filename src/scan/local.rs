@@ -320,7 +320,37 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             }
             p.set_status("Scanning");
             let started = std::time::Instant::now();
-            run(t.clone(), &root, p.clone(), limits, thread_count());
+            // SquirrelDisk-AI fork: on Windows, whole-volume NTFS scans go
+            // through the MFT first (DECISIONS.md, DEC-SCAN-001) — one
+            // sequential read of the master file table instead of walking
+            // directories. Falls back to the walker when the volume handle
+            // is unavailable (no elevation) or the parse refuses.
+            let mut mft_done = false;
+            if volume_root && cfg!(windows) {
+                let drive = root.to_string_lossy();
+                let drive = drive.chars().next().unwrap_or_default().to_string();
+                // a corrupt/adversarial MFT must degrade to the walker, not
+                // take the scan thread down (run() itself avoids panics on
+                // disk-controlled values; this is the belt to its braces)
+                let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::scan::mft::run(t.clone(), &drive, p.clone(), limits)
+                }));
+                match guard {
+                    Ok(done) => mft_done = done,
+                    Err(_) => {
+                        // the tree may be half-assembled: running the walker
+                        // on top of it would double-count. Fail the scan
+                        // honestly instead (DEC-SCAN-002).
+                        p.expected.store(0, Ordering::Relaxed);
+                        p.bytes.store(0, Ordering::Relaxed);
+                        p.fail("NTFS scan crashed (corrupt volume metadata) — scan again");
+                        return;
+                    }
+                }
+            }
+            if !mft_done {
+                run(t.clone(), &root, p.clone(), limits, thread_count());
+            }
             if !p.cancelled() && volume_root {
                 if let Some((total, avail)) = space {
                     // Whatever the volume reports as used but we could not see.

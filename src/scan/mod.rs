@@ -1,5 +1,7 @@
 pub mod demo;
 pub mod local;
+#[cfg(windows)]
+pub mod mft;
 pub mod pathtree;
 pub mod platform;
 pub mod remote;
