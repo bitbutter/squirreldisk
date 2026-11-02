@@ -36,14 +36,14 @@ pub struct Volume {
 
 impl Volume {
     /// `C` (or `C:`) -> unbuffered handle on the raw volume. Fails without
-    /// elevation. FILE_FLAG_NO_BUFFERING bypasses the cache manager (raw DMA
-    /// into our aligned buffers, ~2-3x faster than buffered volume reads);
-    /// it requires sector-aligned offsets, lengths and buffers - all of
-    /// which this reader guarantees.
+    /// elevation. Buffered volume reads (the cache manager copies for us):
+    /// the FILE_FLAG_NO_BUFFERING variant measured faster in isolation but
+    /// ReadFile failed mid-volume on real hardware after ~600MB (see the
+    /// 'reader failed' log line) - buffered is the proven path.
     fn open(drive: &str) -> Option<Volume> {
         use std::os::windows::io::FromRawHandle;
         use windows_sys::Win32::Storage::FileSystem::CreateFileW;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL};
         let letter = drive.trim_end_matches(':').chars().next()?.to_ascii_uppercase();
         if !letter.is_ascii_alphabetic() {
             return None;
@@ -57,7 +57,7 @@ impl Volume {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_NO_BUFFERING,
+                FILE_ATTRIBUTE_NORMAL,
                 std::ptr::null_mut(),
             )
         };
@@ -868,7 +868,8 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
                 if vol_r.read_at(lba, &mut buf).is_err() {
                     let mut f = fail_flag.lock().unwrap();
                     if f.is_none() {
-                        *f = Some("volume read failed".into());
+                        let code = std::io::Error::last_os_error();
+                        *f = Some(format!("volume read failed at lba {lba} len {want}: {code}"));
                     }
                     break 'plan;
                 }
