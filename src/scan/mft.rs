@@ -442,16 +442,19 @@ fn parse_record_buf<'a>(rec: &'a [u8], attrs: &mut [AttrView; MAX_ATTRS]) -> Opt
                 }
             }
             0x30 => {
-                if att.nonresident || att.name_len != 0 || att.content_len < 0x3C {
-                    continue; // 0x3C fixed part; name bounds checked below
+                if att.nonresident || att.name_len != 0 || att.content_len < 0x42 {
+                    continue; // 0x42 fixed part; name bounds checked below
                 }
                 let Some(c) = rec.get(att.content_off..att.content_off + att.content_len) else { continue };
                 let parent = u64at(c, 0x00) & FRN_MASK;
                 let alloc = u64at(c, 0x28);
                 let real = u64at(c, 0x30);
-                let nl = c[0x3A] as usize;
-                let ns = c[0x3B];
-                if nl == 0 || c.len() < 0x3C + nl * 2 {
+                // layout: parent@0, times@8..0x28, alloc@0x28, real@0x30,
+                // flags u32@0x38, reserved@0x3C, name len@0x40, namespace@0x41,
+                // UTF-16 name@0x42 (verified against a live Win11 volume dump)
+                let nl = c[0x40] as usize;
+                let ns = c[0x41];
+                if nl == 0 || c.len() < 0x42 + nl * 2 {
                     continue;
                 }
                 let rank: u8 = match ns {
@@ -466,7 +469,7 @@ fn parse_record_buf<'a>(rec: &'a [u8], attrs: &mut [AttrView; MAX_ATTRS]) -> Opt
                     // $FILE_NAME sizes are directory-entry-time values;
                     // allocated is the disk-usage truth, real the fallback
                     let fn_size = if alloc > 0 { alloc } else { real };
-                    let start = att.content_off + 0x3C;
+                    let start = att.content_off + 0x42;
                     best = Some((rank, start, nl * 2, parent, mtime, fn_size));
                 }
             }
@@ -1125,6 +1128,113 @@ mod tests {
         assert!(live > n as u64 * 9 / 10, "synthetic records must parse");
     }
 
+
+    /// Offline probe against a real MFT dump: `C:\tmp\mft-dump.bin`
+    /// (first 4 KB = boot sector copy, then 1 MB of MFT records).
+    /// Run: cargo test --release --no-default-features mft_dump -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs C:/tmp/mft-dump.bin"]
+    fn mft_dump_probe() {
+        let Ok(data) = std::fs::read("C:/tmp/mft-dump.bin") else {
+            eprintln!("no dump file");
+            return;
+        };
+        let record = 1024usize;
+        let mft = &data[4096..];
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        let mut shown = 0;
+        for i in 0..mft.len() / record {
+            let rec = &mft[i * record..(i + 1) * record];
+            if &rec[..4] != b"FILE" || rec[0x16] & 1 == 0 {
+                continue; // free / not a record: not counted
+            }
+            let mut scratch = rec.to_vec();
+            if !apply_fixups_inplace(&mut scratch, 512) {
+                if shown < 6 {
+                    eprintln!("rec {i}: FIXUP REJECT usa_off={:#x} usa_count={} hdr={}", u16at(rec, 4), u16at(rec, 6), rec[..48].iter().map(|b| format!("{b:02x}")).collect::<String>());
+                    shown += 1;
+                }
+                fail += 1;
+                continue;
+            }
+            let mut attrs = [AttrView::default(); MAX_ATTRS];
+            match parse_record_buf(&scratch, &mut attrs) {
+                Some(_) => ok += 1,
+                None => {
+                    if shown < 6 {
+                        let first = u16at(&scratch, 0x14);
+                        let used = u32at(&scratch, 0x18);
+                        eprintln!(
+                            "rec {i}: PARSE REJECT flags={:#06x} usa_off={:#x} usa_count={} first={:#x} used={} base={} bytes[0x28..0x60]={}",
+                            u16at(&scratch, 0x16),
+                            u16at(&scratch, 4),
+                            u16at(&scratch, 6),
+                            first,
+                            used,
+                            u64at(&scratch, 0x20),
+                            scratch[0x28..0x60].iter().map(|b| format!("{b:02x}")).collect::<String>()
+                        );
+                        shown += 1;
+                    }
+                    fail += 1;
+                }
+            }
+        }
+        eprintln!("dump probe: {ok} parsed, {fail} failed");
+        // bisect: run walk_attributes_buf + the FN acceptance on record 5
+        {
+            let rec = &mft[5 * record..6 * record];
+            let mut scratch = rec.to_vec();
+            assert!(apply_fixups_inplace(&mut scratch, 512));
+            let mut attrs = [AttrView::default(); MAX_ATTRS];
+            let n = walk_attributes_buf(&scratch, &mut attrs);
+            eprintln!("rec5 walk: {:?}", n);
+            if let Some(n) = n {
+                for att in attrs.iter().take(n) {
+                    eprintln!("rec5 attr type={:#x} nr={} nl={} coff={:#x} clen={}", att.type_, att.nonresident as u8, att.name_len, att.content_off, att.content_len);
+                }
+                let mut best: Option<(u8, usize, usize, u64, u64, u64)> = None;
+                for att in attrs.iter().take(n) {
+                    if att.type_ != 0x30 { continue; }
+                    eprintln!("rec5 FN: nr={} nl={} clen={} min_ok={}", att.nonresident, att.name_len, att.content_len, att.content_len >= 0x3C);
+                    let Some(c) = scratch.get(att.content_off..att.content_off + att.content_len) else { eprintln!("rec5 FN: CONTENT GET FAILS {}..{}", att.content_off, att.content_off + att.content_len); continue; };
+                    let nl = c[0x3A] as usize;
+                    let ns = c[0x3B];
+                    eprintln!("rec5 FN: nl={nl} ns={ns} c.len={} need={}", c.len(), 0x3C + nl * 2);
+                    if nl == 0 || c.len() < 0x3C + nl * 2 { eprintln!("rec5 FN: BOUNDS REJECT"); continue; }
+                    eprintln!("rec5 FN: ACCEPTED");
+                    let _ = &mut best;
+                }
+                eprintln!("rec5 parse_record_buf: {:?}", parse_record_buf(&scratch, &mut attrs).map(|_| "ok"));
+            }
+        }
+        // trace the attribute walk of record 5 (the volume root)
+        {
+            let rec = &mft[5 * record..6 * record];
+            let mut scratch = rec.to_vec();
+            if apply_fixups_inplace(&mut scratch, 512) {
+                let first = u16at(&scratch, 0x14) as usize;
+                let used = u32at(&scratch, 0x18) as usize;
+                eprintln!("root trace: first={first:#x} used={used}");
+                let mut off = first;
+                let mut k = 0;
+                while off + 0x10 <= used && k < 12 {
+                    let type_ = u32at(&scratch, off);
+                    let len = u32at(&scratch, off + 4) as usize;
+                    let nr = scratch[off + 8];
+                    eprintln!("  attr@{off:#x}: type={type_:#x} len={len} nonresident={nr} bytes={:?}", &scratch[off..(off + 24).min(used)]);
+                    if type_ == 0xFFFF_FFFF || type_ == 0 || len < 8 {
+                        eprintln!("  -> walk stops (end/invalid)");
+                        break;
+                    }
+                    off += len;
+                    k += 1;
+                }
+            }
+        }
+    }
+
     #[test]
     fn filetime() {
         assert_eq!(filetime_to_unix(0), 0);
@@ -1171,7 +1281,7 @@ mod tests {
         // $FILE_NAME @0x90
         off = 0x90;
         let nl = name.len();
-        let fn_len = 0x18 + 0x3C + nl * 2;
+        let fn_len = 0x18 + 0x42 + nl * 2;
         rec[off..off + 4].copy_from_slice(&0x30u32.to_le_bytes());
         rec[off + 4..off + 8].copy_from_slice(&(fn_len as u32).to_le_bytes());
         rec[off + 0x10..off + 0x14].copy_from_slice(&((fn_len - 0x18) as u32).to_le_bytes());
@@ -1180,10 +1290,11 @@ mod tests {
         rec[f..f + 8].copy_from_slice(&parent.to_le_bytes());
         rec[f + 0x28..f + 0x30].copy_from_slice(&(data.unwrap_or(0)).to_le_bytes());
         rec[f + 0x30..f + 0x38].copy_from_slice(&(data.unwrap_or(0)).to_le_bytes());
-        rec[f + 0x3A] = nl as u8;
-        rec[f + 0x3B] = 3; // Win32+DOS namespace
+        rec[f + 0x38..f + 0x3C].copy_from_slice(&0u32.to_le_bytes()); // flags
+        rec[f + 0x40] = nl as u8;
+        rec[f + 0x41] = 3; // Win32+DOS namespace
         for (k, ch) in name.encode_utf16().collect::<Vec<u16>>().iter().enumerate() {
-            rec[f + 0x3C + k * 2..f + 0x3E + k * 2].copy_from_slice(&ch.to_le_bytes());
+            rec[f + 0x42 + k * 2..f + 0x44 + k * 2].copy_from_slice(&ch.to_le_bytes());
         }
         // resident $DATA after $FILE_NAME
         if let Some(sz) = data.filter(|_| !dir) {
