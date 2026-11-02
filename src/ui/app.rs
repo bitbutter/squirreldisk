@@ -376,6 +376,9 @@ pub struct App {
     pub font_scripts: u32,
     /// Frames spent placing the window on the screen (done at 255).
     pub placing: u8,
+    /// SquirrelDisk-AI: foreground-pull attempts left (UAC-launched windows
+    /// open behind the consent dialog's owner; retried until it wins).
+    pub foreground_pulls: u8,
     /// Folder to scan once the window is up (`squirreldisk <folder>`).
     pub open_at_start: Option<PathBuf>,
     /// Installing the `squirreldisk` command from Settings: the outcome.
@@ -576,6 +579,7 @@ impl App {
             open_at_start: None,
             cli_job: None,
             placing: if std::env::var("SQD_WINDOW").is_ok() { u8::MAX } else { 0 },
+            foreground_pulls: 30,
             font_scripts: 0,
             chrome: if cfg!(target_os = "macos") { (15.0, 68.0) } else { (22.0, 0.0) },
             #[cfg(unix)]
@@ -683,25 +687,51 @@ impl App {
     /// Opens the window centred on the screen the user is working on and
     /// sized to it (see [`super::placement`]). The screen is only known once
     /// the window exists, hence here, on the first frames.
+    /// Windows: bring our window to the foreground. A plain SetForegroundWindow
+    /// is denied when the caller is not foreground-eligible (exactly the UAC
+    /// launch case), so attach our input to the foreground thread first.
+    #[cfg(windows)]
+    fn pull_foreground(&mut self) {
+        use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, FindWindowW, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+        };
+        let title: Vec<u16> = "SquirrelDisk ".encode_utf16().collect();
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if hwnd as usize == 0 {
+            return;
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        if fg == hwnd {
+            if self.foreground_pulls > 1 {
+                crate::scan::scanlog::line("window: foreground acquired");
+            }
+            self.foreground_pulls = 1; // one more frame, then stop
+            return;
+        }
+        let our_tid = unsafe { GetCurrentThreadId() };
+        let fg_tid = if fg as usize == 0 { 0 } else { unsafe { GetWindowThreadProcessId(fg, std::ptr::null_mut()) } };
+        let attached = fg_tid != 0 && fg_tid != our_tid && unsafe { AttachThreadInput(our_tid, fg_tid, 1) } != 0;
+        unsafe {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            if attached {
+                let _ = SetFocus(hwnd);
+            }
+        }
+        if attached {
+            unsafe { AttachThreadInput(our_tid, fg_tid, 0) };
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn pull_foreground(&mut self) {}
+
     fn place_window(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         use super::placement::{fit, on_active_screen, Placed};
         if self.placing == u8::MAX {
             return;
-        }
-        // SquirrelDisk-AI: launch paths that go through UAC (the "runas"
-        // admin shortcut) often leave the new window BEHIND the consent
-        // dialog's owner — pull it to the foreground on the first frames.
-        #[cfg(windows)]
-        if (3..=12).contains(&self.placing) {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{BringWindowToTop, FindWindowW, SetForegroundWindow};
-            let title: Vec<u16> = "SquirrelDisk ".encode_utf16().collect();
-            let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-            if hwnd as usize != 0 {
-                unsafe {
-                    let _ = SetForegroundWindow(hwnd);
-                    let _ = BringWindowToTop(hwnd);
-                }
-            }
         }
         self.placing = self.placing.saturating_add(1);
         ctx.request_repaint();
@@ -1015,6 +1045,11 @@ impl eframe::App for App {
         }
         let _ = &frame;
         self.place_window(&ctx, frame);
+        #[cfg(windows)]
+        if self.foreground_pulls > 1 {
+            self.pull_foreground();
+            self.foreground_pulls -= 1;
+        }
         if let Some(folder) = self.open_at_start.take() {
             let mount = folder.to_string_lossy();
             match self.volumes.iter().find(|v| v.mount == mount).cloned() {
