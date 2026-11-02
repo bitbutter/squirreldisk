@@ -835,7 +835,12 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     let free_pool: std::sync::Arc<std::sync::Mutex<Vec<AlignedBuf>>> =
         std::sync::Arc::new(std::sync::Mutex::new((0..4).map(|_| AlignedBuf::new(chunk as usize)).collect()));
     let mut readers = Vec::new();
-    for reader_id in 0..2u8 {
+    // ONE reader: two concurrent raw-volume readers made ReadFile fail
+    // deterministically mid-scan (FALSE + os error 0 at the same chunk every
+    // run — filter-driver class). Revisit with overlapped I/O on ONE handle,
+    // not two handles racing. Single reader + parse overlap was the proven
+    // 7.8s path.
+    for reader_id in 0..1u8 {
         let Some(mut vol_r) = Volume::open(drive) else {
             super::scanlog::line("mft: reader handle open failed (sharing violation?)");
             break;
