@@ -272,8 +272,9 @@ struct AttrView {
     lowest_vcn: u64,
 }
 
-/// Most records carry <= 4 attributes; 8 covers the rest without heap.
-const MAX_ATTRS: usize = 8;
+/// Most records carry <= 4 attributes; 16 covers hardlink-heavy base
+/// records (attribute chains are type-sorted; $DATA sits late) without heap.
+const MAX_ATTRS: usize = 16;
 
 /// Walks the attribute chain of one fixed-up record into `out`; returns the
 /// count. No allocation.
@@ -685,22 +686,37 @@ pub fn needs_admin(drive: &str) -> bool {
 pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanLimits) -> bool {
     let prev_expected = progress.expected.load(Ordering::Relaxed);
     let restore = |progress: &Progress| {
-        // hand the progress bar back to caller semantics so a walker
-        // fallback is not pegged at 99% by half-read MFT bytes
+        // hand the progress counters back to caller semantics so a walker
+        // fallback is not pegged at 99% (or double-counted) by half-read MFT
         progress.expected.store(prev_expected, Ordering::Relaxed);
         progress.bytes.store(0, Ordering::Relaxed);
+        progress.files.store(0, Ordering::Relaxed);
+        progress.errors.store(0, Ordering::Relaxed);
     };
     let mut vol = match Volume::open(drive) {
         Some(v) => v,
-        None => return false,
+        None => {
+            super::scanlog::line(&format!("mft {drive}: volume open failed (elevated={})", super::scanlog::elevated()));
+            return false;
+        }
     };
     let lay = match MftLayout::parse(&mut vol) {
         Some(l) => l,
         None => {
+            super::scanlog::line(&format!("mft {drive}: layout parse refused (boot/MFT record), falling back to directories"));
             restore(&progress);
             return false;
         }
     };
+    super::scanlog::line(&format!(
+        "mft {drive}: layout ok — record={}B clusters={} runs={} total={:.1}MB threads={}",
+        lay.record_bytes,
+        lay.cluster_bytes,
+        lay.runs.len(),
+        lay.total_bytes as f64 / 1e6,
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+    ));
+    let t_start = std::time::Instant::now();
     progress.set_status("Reading NTFS master file table");
     progress.expected.store(lay.total_bytes, Ordering::Relaxed);
 
@@ -781,7 +797,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
 
     let mut seen_bytes = 0u64;
     let mut plan_idx = 0usize;
-    while let Ok(mut buf) = rx.recv() {
+    while let Ok(buf) = rx.recv() {
         if progress.cancelled() {
             break;
         }
@@ -849,8 +865,19 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     }
     drop(tx_back);
     let _ = reader.join();
+    {
+        let cancelled = progress.cancelled();
+        super::scanlog::line(&format!(
+            "mft: read+parse {:.2}s — {:.0}MB, {} live records, {} errors{}",
+            t_start.elapsed().as_secs_f32(),
+            seen_bytes as f64 / 1e6,
+            tlive.iter().sum::<u64>(),
+            progress.errors.load(Ordering::Relaxed),
+            if cancelled { ", cancelled" } else { "" }
+        ));
+    }
     if let Some(err) = read_failed.lock().unwrap().take() {
-        let _ = err;
+        super::scanlog::line(&format!("mft: reader failed after {}/{} chunks: {err}", plan_idx, plan.len()));
         restore(&progress);
         return false;
     }
@@ -902,8 +929,15 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
             *e = (*e).max(v);
         }
     }
+    super::scanlog::line(&format!(
+        "mft: staged {} dirs, {} ext-data entries (merge {:.2}s)",
+        dirs.len(),
+        ext.len(),
+        t_start.elapsed().as_secs_f32()
+    ));
 
     if !dirs.get(&ROOT_FRN).is_some_and(|d| d.named()) {
+        super::scanlog::line("mft: no usable root record staged, falling back to directories");
         restore(&progress);
         return false; // no usable root: wrong parse — let the walker do it
     }
@@ -915,6 +949,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
 
     // assemble: children index, then BFS from the root
     progress.set_status("Building tree");
+    let t_assemble = std::time::Instant::now();
     let mut kids: HashMap<u64, Vec<u64>> = HashMap::new();
     let keys: Vec<u64> = dirs.keys().copied().collect();
     for frn in keys {
@@ -952,6 +987,11 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         t.get_mut(root).flags |= F_DONE;
         // staged dirs never reached from the root (orphaned cycles, records
         // for deleted parents) are dropped; hidden-space absorbs their size
+        super::scanlog::line(&format!(
+            "mft: assembly {:.2}s — {} nodes",
+            t_assemble.elapsed().as_secs_f32(),
+            t.nodes.len()
+        ));
     }
     true
 }

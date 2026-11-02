@@ -5,6 +5,7 @@ pub mod mft;
 pub mod pathtree;
 pub mod platform;
 pub mod remote;
+pub mod scanlog;
 
 use crate::tree::Tree;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

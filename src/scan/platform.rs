@@ -228,6 +228,17 @@ pub fn is_volume_root(path: &Path) -> bool {
     if path.parent().is_none() {
         return true;
     }
+    #[cfg(windows)]
+    {
+        // SquirrelDisk-AI fix: `Path::new("C:\\").parent()` is Some("C:"),
+        // so the generic check above misses drive roots — and this function
+        // drove the MFT-engine choice and volume-aware scan limits, which
+        // were silently never active on Windows.
+        let s = path.to_string_lossy();
+        let s = s.trim_end_matches(['\\', '/']);
+        let b = s.as_bytes();
+        b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    }
     #[cfg(unix)]
     {
         match (device_of(path), path.parent().and_then(device_of)) {
@@ -235,7 +246,7 @@ pub fn is_volume_root(path: &Path) -> bool {
             _ => false,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(windows, unix)))]
     {
         false
     }

@@ -8,7 +8,7 @@
 
 use super::theme::{lerp_color, Theme};
 use crate::tree::{Kind, Tree, NONE};
-use eframe::egui::{Color32, Pos2, Vec2};
+use eframe::egui::{self, Color32, Pos2, Vec2};
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 
@@ -134,7 +134,9 @@ pub fn layout(tree: &Tree, view: View, geo: &Geometry, rings: usize, theme: &The
     let whole = total + free;
     if free > 0 {
         let a0 = TAU * (total as f64 / whole as f64) as f32;
-        let color = lerp_color(theme.bg_top, theme.text_faint, 0.32);
+        // SquirrelDisk-AI: free space reads as unmistakable grey — dark in
+        // dark themes, light in light themes — never as a data hue
+        let color = if theme.dark { egui::Color32::from_gray(64) } else { egui::Color32::from_gray(176) };
         out.push(Seg { key: FREE_KEY, node: view.node, kind: SegKind::Free, a0, a1: TAU, depth: 1, color, size: free });
     }
     let mut stack: Vec<(Vec<u32>, usize, u64, f32, f32, u8)> = vec![(kids, 0, whole, 0.0, TAU, 1)];

@@ -320,6 +320,12 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             }
             p.set_status("Scanning");
             let started = std::time::Instant::now();
+            crate::scan::scanlog::line(&format!(
+                "scan start: {} (volume_root={} elevated={})",
+                root.display(),
+                volume_root,
+                crate::scan::scanlog::elevated()
+            ));
             // SquirrelDisk-AI fork: on Windows, whole-volume NTFS scans go
             // through the MFT first (DECISIONS.md, DEC-SCAN-001) — one
             // sequential read of the master file table instead of walking
@@ -331,15 +337,20 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
                 let drive = drive.chars().next().unwrap_or_default().to_string();
                 if crate::scan::mft::needs_admin(&drive) {
                     p.hint.lock().unwrap().replace("Fast NTFS scan needs administrator — Settings → Relaunch as administrator".into());
+                    crate::scan::scanlog::line("mft: needs admin (volume handle denied)");
                 }
                 // a corrupt/adversarial MFT must degrade to the walker, not
                 // take the scan thread down (run() itself avoids panics on
                 // disk-controlled values; this is the belt to its braces)
+                let t_mft = std::time::Instant::now();
                 let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::scan::mft::run(t.clone(), &drive, p.clone(), limits)
                 }));
                 match guard {
-                    Ok(done) => mft_done = done,
+                    Ok(done) => {
+                        mft_done = done;
+                        crate::scan::scanlog::line(&format!("mft engine: done={} in {:.2}s", done, t_mft.elapsed().as_secs_f32()));
+                    }
                     Err(_) => {
                         // the tree may be half-assembled: running the walker
                         // on top of it would double-count. Fail the scan
@@ -367,6 +378,13 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             }
             let engine = if mft_done { "NTFS master file table" } else { "directories" };
             p.set_status(format!("Scanned in {:.1}s · {}", started.elapsed().as_secs_f32(), engine));
+            crate::scan::scanlog::line(&format!(
+                "scan done in {:.2}s via {}: {} files, {}",
+                started.elapsed().as_secs_f32(),
+                engine,
+                p.files.load(Ordering::Relaxed),
+                crate::tree::fmt_size(p.bytes.load(Ordering::Relaxed))
+            ));
             p.done.store(true, Ordering::Relaxed);
         })
         .expect("spawn scan thread");

@@ -437,6 +437,18 @@ impl App {
                 widgets::ring(p, geo.center, r0 + 1.0, 2.0, f, theme.accent, Color32::TRANSPARENT);
             }
             self.scan_pill(p, chart, si);
+        } else {
+            // SquirrelDisk-AI: keep the final status visible after the scan —
+            // duration AND which engine ran ("NTFS master file table" vs
+            // "directories"), at the root view of volume scans
+            let status = s.progress.status.lock().unwrap().clone();
+            let at_root = s.view.node == s.tree.read().unwrap().root;
+            if at_root && status.starts_with("Scanned in") {
+                let g = p.layout_no_wrap(status.clone(), font(11.5), theme.text_faint);
+                let pill = Rect::from_center_size(Pos2::new(chart.center().x, chart.top() + 16.0), Vec2::new(g.size().x + 24.0, 26.0));
+                p.rect_filled(pill, cr(8.0), with_alpha(theme.surface_hi, 0.85));
+                p.galley(Pos2::new(pill.left() + 12.0, pill.center().y - g.size().y / 2.0), g, theme.text_faint);
+            }
         }
     }
 
