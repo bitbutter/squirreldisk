@@ -122,6 +122,11 @@ impl Tree {
         &mut self.nodes[id as usize]
     }
 
+    /// Reserves arena capacity for `n` more nodes (bulk builders).
+    pub fn reserve(&mut self, n: usize) {
+        self.nodes.reserve(n);
+    }
+
     /// Sets a node's modification time (unix seconds).
     pub fn set_mtime(&mut self, id: u32, secs: u64) {
         if let Some(n) = self.nodes.get_mut(id as usize) {

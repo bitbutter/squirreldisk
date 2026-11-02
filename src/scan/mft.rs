@@ -35,14 +35,36 @@ struct Volume {
 }
 
 impl Volume {
-    /// `C` (or `C:`) → handle on `\\.\C:`. Fails without elevation.
+    /// `C` (or `C:`) -> unbuffered handle on the raw volume. Fails without
+    /// elevation. FILE_FLAG_NO_BUFFERING bypasses the cache manager (raw DMA
+    /// into our aligned buffers, ~2-3x faster than buffered volume reads);
+    /// it requires sector-aligned offsets, lengths and buffers - all of
+    /// which this reader guarantees.
     fn open(drive: &str) -> Option<Volume> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
         let letter = drive.trim_end_matches(':').chars().next()?.to_ascii_uppercase();
         if !letter.is_ascii_alphabetic() {
             return None;
         }
-        let path = format!(r"\\.\{letter}:");
-        let file = std::fs::File::open(&path).ok()?;
+        let device = format!("\\\\.\\{letter}:");
+        let wide: Vec<u16> = device.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_NO_BUFFERING,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
         // 4096 satisfies both 512-byte and 4Kn volumes for the boot read
         Some(Volume { file, sector: 4096 })
     }
@@ -764,40 +786,57 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     // buffers): read of chunk N+1 overlaps the parallel parse of chunk N,
     // so the whole pass costs ~max(I/O, parse) instead of their sum.
     let read_failed: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let fail_flag = read_failed.clone();
+    // two readers on separate unbuffered handles, interleaving the plan:
+    // two outstanding reads give the NVMe queue depth it wants (~2x I/O)
     let (tx, rx): (std::sync::mpsc::Sender<AlignedBuf>, std::sync::mpsc::Receiver<AlignedBuf>) = std::sync::mpsc::channel();
     let (tx_back, rx_back): (std::sync::mpsc::Sender<AlignedBuf>, std::sync::mpsc::Receiver<AlignedBuf>) = std::sync::mpsc::channel();
-    let p_for_reader = progress.clone();
-    let plan_for_reader = plan.clone();
-    let reader = std::thread::spawn(move || {
-        let mut bufs = vec![AlignedBuf::new(chunk as usize), AlignedBuf::new(chunk as usize)];
-        'plan: for &(lba, want, _base) in &plan_for_reader {
-            if p_for_reader.cancelled() {
-                break 'plan;
-            }
-            let mut buf = match bufs.pop() {
-                Some(b) => b,
-                None => match rx_back.recv() {
-                    Ok(b) => b,
-                    Err(_) => break 'plan,
-                },
-            };
-            buf.set_len(want as usize);
-            if vol.read_at(lba, &mut buf).is_err() {
-                let mut f = fail_flag.lock().unwrap();
-                if f.is_none() {
-                    *f = Some("volume read failed".into());
+    let back_shared: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<AlignedBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(rx_back));
+    let free_pool: std::sync::Arc<std::sync::Mutex<Vec<AlignedBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new((0..4).map(|_| AlignedBuf::new(chunk as usize)).collect()));
+    let mut readers = Vec::new();
+    for reader_id in 0..2u8 {
+        let Some(mut vol_r) = Volume::open(drive) else { break };
+        let plan_r: Vec<(u64, u64, u64)> = plan
+            .clone()
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| (*i as u8 % 2) == reader_id)
+            .map(|(_, p)| p)
+            .collect();
+        let tx = tx.clone();
+        let back = back_shared.clone();
+        let pool = free_pool.clone();
+        let fail_flag = read_failed.clone();
+        let p_r = progress.clone();
+        readers.push(std::thread::spawn(move || {
+            'plan: for &(lba, want, _base) in &plan_r {
+                if p_r.cancelled() {
+                    break 'plan;
                 }
-                break 'plan;
+                let mut buf = match pool.lock().unwrap().pop() {
+                    Some(b) => b,
+                    None => match back.lock().unwrap().recv() {
+                        Ok(b) => b,
+                        Err(_) => break 'plan,
+                    },
+                };
+                buf.set_len(want as usize);
+                if vol_r.read_at(lba, &mut buf).is_err() {
+                    let mut f = fail_flag.lock().unwrap();
+                    if f.is_none() {
+                        *f = Some("volume read failed".into());
+                    }
+                    break 'plan;
+                }
+                if tx.send(buf).is_err() {
+                    break 'plan;
+                }
             }
-            if tx.send(buf).is_err() {
-                break 'plan;
-            }
-        }
-        // end-of-stream (or failure): main's recv() unblocks with None
-        drop(tx);
-    });
-
+        }));
+    }
+    drop(tx); // readers hold their own senders; rx ends when all are done
+    drop(vol); // the layout handle is no longer needed
     let mut seen_bytes = 0u64;
     let mut plan_idx = 0usize;
     while let Ok(buf) = rx.recv() {
@@ -867,7 +906,9 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         }
     }
     drop(tx_back);
-    let _ = reader.join();
+    for r in readers {
+        let _ = r.join();
+    }
     {
         let cancelled = progress.cancelled();
         super::scanlog::line(&format!(
@@ -969,6 +1010,9 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     {
         let mut t = tree.write().unwrap();
         let root = t.root;
+        // node estimate: staged dirs + their kept files (live/4 measured on a
+        // real volume: 5.4M live -> 1.36M nodes); avoids ~40 arena regrows
+        t.reserve(dirs.values().map(|d| d.files.len()).sum::<usize>().saturating_add(dirs.len()).saturating_add(16));
         if let Some(m) = dirs.get(&ROOT_FRN).map(|d| d.mtime) {
             t.set_mtime(root, m);
         }
@@ -980,7 +1024,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         // assemble in frontier batches, releasing the tree write lock between
         // batches so the sunburst keeps animating while the tree fills
         while !queue.is_empty() {
-            let batch: Vec<u64> = queue.drain(..512.min(queue.len())).collect();
+            let batch: Vec<u64> = queue.drain(..2048.min(queue.len())).collect();
             for frn in batch {
                 assemble_one(&mut t, &mut dirs, &mut node_of, &mut queue, &mut total_files, frn, &ext, &kids, &limits, &progress);
             }
@@ -1230,6 +1274,152 @@ mod tests {
                     }
                     off += len;
                     k += 1;
+                }
+            }
+        }
+    }
+
+
+    /// Full-dump bench: parse+stage throughput against E:\mft-full.bin,
+    /// streamed chunk-by-chunk exactly like the engine (read and parse timed
+    /// separately). Run with: --release --ignored --nocapture
+    #[test]
+    #[ignore = "needs E:/mft-true.bin"]
+    fn bench_full_dump() {
+        use std::io::{Read, Seek};
+        let record = 1024usize;
+        let total: usize = 5_665_194_496; // dump size minus the 4KB boot copy
+        let usable = total - total % record;
+        let mut f = std::fs::File::open("E:/mft-true.bin").expect("dump file");
+        f.seek(std::io::SeekFrom::Start(4096)).unwrap();
+        let limits = ScanLimits { keep_min: 1 << 20, max_files_per_dir: 48 };
+        let threads = 12usize;
+        let est = ((usable / record) / 8).max(1024);
+        let mut tdirs: Vec<HashMap<u64, Staged>> = (0..threads).map(|_| HashMap::with_capacity(est / threads)).collect();
+        let mut texts: Vec<HashMap<u64, u64>> = (0..threads).map(|_| HashMap::new()).collect();
+        let mut tlive: Vec<u64> = vec![0; threads];
+        let chunk = 64 << 20;
+        let mut buf = vec![0u8; chunk];
+        let t_all = std::time::Instant::now();
+        let mut t_read = 0f32;
+        let mut parsed = 0usize;
+        let mut done = 0usize;
+        while done < usable {
+            let want = (usable - done).min(chunk);
+            let t0 = std::time::Instant::now();
+            f.read_exact(&mut buf[..want]).expect("dump read");
+            t_read += t0.elapsed().as_secs_f32();
+            let b = &buf[..want];
+            let n = b.len() / record;
+            let slice = (n / threads).max(1) * record;
+            let base = (done / record) as u64;
+            std::thread::scope(|sc| {
+                let it = tdirs.iter_mut().zip(texts.iter_mut()).zip(tlive.iter_mut());
+                for (t, ((dirs_t, ext_t), live_t)) in it.enumerate() {
+                    let start = t * slice;
+                    if start >= b.len() { break; }
+                    let end_t = if t + 1 == threads || (t + 1) * slice >= b.len() { b.len() } else { (t + 1) * slice };
+                    let end_t = end_t - end_t % record;
+                    if end_t <= start { continue; }
+                    let b_t: &[u8] = &b[start..end_t];
+                    let base = base + (start / record) as u64;
+                    let limits = &limits;
+                    sc.spawn(move || {
+                        let mut scratch = vec![0u8; record];
+                        let mut attrs = [AttrView::default(); MAX_ATTRS];
+                        for (i, o) in (0..b_t.len()).step_by(record).enumerate() {
+                            let hdr = &b_t[o..o + record];
+                            if &hdr[..4] != b"FILE" || hdr[0x16] & 1 == 0 { continue; }
+                            scratch.copy_from_slice(hdr);
+                            if !apply_fixups_inplace(&mut scratch, 512) { continue; }
+                            if let Some(p) = parse_record_buf(&scratch, &mut attrs) {
+                                *live_t += 1;
+                                stage_ref(dirs_t, ext_t, base + i as u64, p, limits);
+                            }
+                        }
+                    });
+                }
+            });
+            parsed += n;
+            done += want;
+        }
+        let dirs_total: usize = tdirs.iter().map(|d| d.len()).sum();
+        let live: u64 = tlive.iter().sum();
+        let parse_s = t_all.elapsed().as_secs_f32() - t_read;
+        eprintln!(
+            "FULLDUMP: parse+stage {:.2}s = {:.0} MB/s - {} live records, {} staged dirs",
+            parse_s, (usable as f64 / 1e6) / parse_s as f64, live, dirs_total
+        );
+        // merge (same code shape as the engine)
+        let t_m = std::time::Instant::now();
+        let mut dirs: HashMap<u64, Staged> = tdirs.swap_remove(0);
+        for other in tdirs {
+            for (frn, st) in other {
+                use std::collections::hash_map::Entry;
+                match dirs.entry(frn) {
+                    Entry::Occupied(mut e) => {
+                        let dst = e.get_mut();
+                        if dst.name.is_empty() && !st.name.is_empty() {
+                            dst.name = st.name;
+                            dst.parent = st.parent;
+                            dst.mtime = st.mtime;
+                        }
+                        for (f, n, sz, m) in st.files {
+                            dst.add_file(f, n, sz, m, &limits);
+                        }
+                        if let Some((h, _)) = st.heap {
+                            use std::cmp::Reverse;
+                            for Reverse((sz, f, n, m)) in h {
+                                dst.add_file(f, n, sz, m, &limits);
+                            }
+                        }
+                        dst.small_size = dst.small_size.saturating_add(st.small_size);
+                        dst.small_count = dst.small_count.saturating_add(st.small_count);
+                        for m in st.mounts {
+                            if dst.mounts.len() < 64 {
+                                dst.mounts.push(m);
+                            }
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(st);
+                    }
+                }
+            }
+        }
+        let mut ext: HashMap<u64, u64> = texts.swap_remove(0);
+        for other in texts {
+            for (k, v) in other {
+                let e = ext.entry(k).or_insert(0);
+                *e = (*e).max(v);
+            }
+        }
+        for st in dirs.values_mut() {
+            st.finish_files();
+        }
+        eprintln!("FULLDUMP: merge+drain {:.2}s - {} dirs", t_m.elapsed().as_secs_f32(), dirs.len());
+    }
+
+
+    /// Prints the $MFT run list from the dump's record 0, as PS read commands.
+    #[test]
+    #[ignore = "needs E:/mft-true.bin"]
+    fn mft_runs_from_dump() {
+        let data = std::fs::read("E:/mft-true.bin").expect("dump");
+        let rec = &data[4096..4096 + 1024];
+        let mut scratch = rec.to_vec();
+        assert!(apply_fixups_inplace(&mut scratch, 512));
+        let mut attrs = [AttrView::default(); MAX_ATTRS];
+        let n = walk_attributes_buf(&scratch, &mut attrs).unwrap();
+        for att in attrs.iter().take(n) {
+            if att.type_ == 0x80 && att.name_len == 0 && att.nonresident {
+                let runs = parse_dataruns(&scratch, att.run_off).unwrap();
+                let bps = u16at(&data[0x0B..], 0).to_le();
+                let bps = bps as u64;
+                let spc = data[0x0D] as u64;
+                let clus = bps * spc;
+                for (lcn, clusters) in runs {
+                    eprintln!("RUN {} {}", lcn * clus, clusters * clus);
                 }
             }
         }
