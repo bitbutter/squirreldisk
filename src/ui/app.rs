@@ -82,6 +82,11 @@ pub struct Session {
     /// scripts found in them (see [`crate::i18n::scripts_of`]).
     pub names_checked: usize,
     pub name_scripts: u32,
+    /// Sorted children of the two folders the frame reads most (the chart
+    /// view and the side-panel folder), valid for one tree version each.
+    /// Both are read every frame; without the cache a wide folder is re-sorted
+    /// twice per frame (measured ~1 ms per 50k children, at 60 fps).
+    pub kids_cache: [(u64, u32, Vec<u32>, u64); 2],
     /// SquirrelDisk-AI fork: the AI advice panel state (side panel, AI tab).
     pub ai: crate::ai::AiPanel,
 }
@@ -132,6 +137,7 @@ impl Session {
             free_at: Instant::now() - Duration::from_secs(60),
             names_checked: 0,
             name_scripts: 0,
+            kids_cache: std::array::from_fn(|_| (0, u32::MAX, Vec::new(), 0)),
             ai: crate::ai::AiPanel::default(),
         }
     }
@@ -219,6 +225,27 @@ impl Session {
 
     pub fn is_collected(&self, t: &crate::tree::Tree, node: u32) -> bool {
         self.collector.iter().any(|c| *c == node || t.is_ancestor(*c, node))
+    }
+
+    /// Sorted children of `node` (largest first) and the plain sum of their
+    /// sizes, cached per tree version in a two-slot cache (the chart view and
+    /// the side-panel folder are the two hot ones). The chart center label,
+    /// center size and the panel rows read this every frame; re-sorting a
+    /// wide folder twice per frame was measurable at 60 fps.
+    ///
+    /// Callers must hold the tree guard via a cloned `SharedTree` (not through
+    /// `self.tree`), so `&mut self` stays available for the cache write.
+    pub(crate) fn sorted_kids(&mut self, t: &crate::tree::Tree, node: u32) -> (&[u32], u64) {
+        if let Some(i) = self.kids_cache.iter().position(|c| c.0 == t.version && c.1 == node) {
+            let (sum, kids) = (self.kids_cache[i].3, &self.kids_cache[i].2);
+            return (kids, sum);
+        }
+        let kids = t.sorted_children(node);
+        let sum: u64 = kids.iter().map(|k| t.get(*k).size).sum();
+        // two views of the same version share the two slots; anything older goes
+        let i = self.kids_cache.iter().position(|c| c.0 != t.version).unwrap_or(0);
+        self.kids_cache[i] = (t.version, node, kids, sum);
+        (self.kids_cache[i].2.as_slice(), self.kids_cache[i].3)
     }
 }
 
@@ -627,15 +654,21 @@ impl App {
 
     /// File and volume names can be in any script: loads fonts for the ones
     /// they use, else e.g. Chinese folder names show as boxes in English.
+    /// The sweep is capped per frame so a tree that just finished assembling
+    /// cannot stall a single frame on 1M+ names (measured: ~15 ns/name, so
+    /// the cap bounds the worst frame at ~4 ms).
     fn fonts_for_names(&mut self, ctx: &egui::Context) {
         use crate::i18n::scripts_of;
+        const MAX_NAMES_PER_FRAME: usize = 262_144;
         let mut scripts = self.volumes.iter().fold(0, |bits, v| bits | scripts_of(&v.name));
         for s in self.sessions.iter_mut() {
             let t = s.tree.read().unwrap();
             // nodes are only ever appended: each name is checked once
             let new = t.nodes.get(s.names_checked..).unwrap_or_default();
-            s.name_scripts = new.iter().fold(s.name_scripts | scripts_of(&t.root_path), |bits, n| bits | scripts_of(&n.name));
-            s.names_checked = t.nodes.len();
+            let take = new.len().min(MAX_NAMES_PER_FRAME);
+            let root_bits = scripts_of(&t.root_path);
+            s.name_scripts = new[..take].iter().fold(s.name_scripts | root_bits, |bits, n| bits | scripts_of(&n.name));
+            s.names_checked += take;
             scripts |= s.name_scripts;
         }
         // recomputed from what is open, so closing a session frees its fonts
@@ -806,10 +839,17 @@ impl App {
                     // scan → teaser for the AI panel, and the AI tab opens by
                     // itself so the Ask button is on screen the moment the scan
                     // lands (DEC-AI-003: still no network without a click).
+                    let teaser_ms;
                     {
                         let t = s.tree.read().unwrap();
+                        let t0 = Instant::now();
                         s.ai.teaser = crate::ai::teaser(&t);
+                        teaser_ms = t0.elapsed().as_millis();
                     }
+                    scan::scanlog::line(&format!("display: teaser pass {} ms ({} nodes)", teaser_ms, s.tree.read().unwrap().nodes.len()));
+                    // the final layout must not wait for the scanning throttle:
+                    // let the next chart frame show the finished tree at once
+                    s.last_layout = Instant::now() - Duration::from_secs(1);
                     s.ai.teaser_seen = false;
                     // a rescan replaced the tree: the old dossier, triage and
                     // chat describe files that may not exist anymore — start

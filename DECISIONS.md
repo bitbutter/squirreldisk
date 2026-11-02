@@ -43,6 +43,10 @@ Context: the per-record hardlink rule is deliberate — it is the file's real oc
 
 DEC-SCAN-004: The fork targets Windows only. Cross-platform code from upstream is left in place where harmless; no effort is spent keeping other targets building.
 
+DEC-SCAN-005: Repeat whole-volume scans rebuild from the USN cache: after a successful MFT scan the engine writes the assembled arena plus a USN journal checkpoint to `<config_dir>/mft-cache-<drive>.bin` on a background thread, and the next scan of the same volume replays the journal's close-records since that checkpoint onto the cached tree instead of re-reading the MFT. Any doubt discards the cache and runs the full scan without asking: journal ID changed, checkpoint below the lowest valid USN (wrapped/reset), record parse hiccup, replay backlog over the cap, unknown parent for a created entry, magic/version/checksum mismatch. The replay is approximate where the tree is aggregated — files folded into a "small files" node carry no file reference number, so their changes land as aggregate staleness until the next full scan or a watcher refresh, and re-added files are sized by the walker's stat rules (a cloud placeholder counts 0 where an MFT read would show its on-disk allocation).
+
+Context: repeat scans drop to ~1s (cache load + journal replay). The cache is an integrity-checked local artifact written by the app itself; the replay validates the journal identity before any tree mutation, the patch runs on a detached node vector first so a refusal leaves the live tree untouched for the full-scan fallback (DEC-SCAN-002), and re-serialization after every scan keeps staleness from compounding.
+
 ## Open
 
 - Scan snapshots + diff ("where did my space go since last month") — computed locally, LLM narrates.

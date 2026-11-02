@@ -127,6 +127,19 @@ impl Tree {
         self.nodes.reserve(n);
     }
 
+    /// Replaces the whole arena (USN-cache restore). `nodes[0]` must be the
+    /// root; `detached` is the tombstone count of the serialized tree.
+    pub fn install_nodes(&mut self, nodes: Vec<Node>, detached: usize) {
+        self.nodes = nodes;
+        self.detached = detached;
+        self.version += 1;
+    }
+
+    /// Number of tombstoned (removed) nodes still in the arena.
+    pub fn detached_count(&self) -> usize {
+        self.detached
+    }
+
     /// Sets a node's modification time (unix seconds).
     pub fn set_mtime(&mut self, id: u32, secs: u64) {
         if let Some(n) = self.nodes.get_mut(id as usize) {
@@ -156,6 +169,27 @@ impl Tree {
         let next = self.get(parent).first_child;
         self.nodes.push(Node {
             name: name.into(),
+            size,
+            files,
+            parent,
+            first_child: NONE,
+            next_sibling: next,
+            kind,
+            flags: 0,
+            mtime: 0,
+        });
+        self.get_mut(parent).first_child = id;
+        self.version += 1;
+        id
+    }
+
+    /// Bulk-builder variant that moves the name in instead of allocating a
+    /// fresh `Box<str>` per node (assembly of a million nodes at a time).
+    pub fn add_child_owned(&mut self, parent: u32, name: Box<str>, kind: Kind, size: u64, files: u32) -> u32 {
+        let id = self.nodes.len() as u32;
+        let next = self.get(parent).first_child;
+        self.nodes.push(Node {
+            name,
             size,
             files,
             parent,

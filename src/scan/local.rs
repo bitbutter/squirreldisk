@@ -310,6 +310,7 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
     std::thread::Builder::new()
         .name("scan".into())
         .spawn(move || {
+            let t_prep = std::time::Instant::now();
             let volume_root = platform::is_volume_root(&root);
             let space = platform::volume_space(&root);
             let mut limits = ScanLimits::default();
@@ -321,10 +322,11 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             p.set_status("Scanning");
             let started = std::time::Instant::now();
             crate::scan::scanlog::line(&format!(
-                "scan start: {} (volume_root={} elevated={})",
+                "scan start: {} (volume_root={} elevated={} prep {:.1}ms)",
                 root.display(),
                 volume_root,
-                crate::scan::scanlog::elevated()
+                crate::scan::scanlog::elevated(),
+                t_prep.elapsed().as_secs_f32() * 1000.0
             ));
             // SquirrelDisk-AI fork: on Windows, whole-volume NTFS scans go
             // through the MFT first (DECISIONS.md, DEC-SCAN-001) — one
@@ -335,7 +337,14 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             if volume_root && cfg!(windows) {
                 let drive = root.to_string_lossy();
                 let drive = drive.chars().next().unwrap_or_default().to_string();
-                if crate::scan::mft::needs_admin(&drive) {
+                let t_admin = std::time::Instant::now();
+                let needs = crate::scan::mft::needs_admin(&drive);
+                crate::scan::scanlog::line(&format!(
+                    "mft: needs_admin probe {:.1}ms (needs={})",
+                    t_admin.elapsed().as_secs_f32() * 1000.0,
+                    needs
+                ));
+                if needs {
                     p.hint.lock().unwrap().replace("Fast NTFS scan needs administrator — Settings → Relaunch as administrator".into());
                     crate::scan::scanlog::line("mft: needs admin (volume handle denied)");
                 }
@@ -365,6 +374,7 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
             if !mft_done {
                 run(t.clone(), &root, p.clone(), limits, thread_count());
             }
+            let t_hidden = std::time::Instant::now();
             if !p.cancelled() && volume_root {
                 if let Some((total, avail)) = space {
                     // Whatever the volume reports as used but we could not see.
@@ -376,6 +386,7 @@ pub fn start(root: PathBuf, display_name: String) -> ScanHandle {
                     }
                 }
             }
+            crate::scan::scanlog::line(&format!("hidden-space calc {:.1}ms", t_hidden.elapsed().as_secs_f32() * 1000.0));
             let engine = if mft_done { "NTFS master file table" } else { "directories" };
             p.set_status(format!("Scanned in {:.1}s · {}", started.elapsed().as_secs_f32(), engine));
             crate::scan::scanlog::line(&format!(

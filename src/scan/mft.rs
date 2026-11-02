@@ -16,8 +16,8 @@
 
 use super::local::SMALL_FILES_NAME;
 use super::{Progress, ScanLimits, SharedTree};
-use crate::tree::{Kind, Tree, F_DONE, F_EXPANDABLE};
-use std::collections::{HashMap, VecDeque};
+use crate::tree::{Kind, F_DONE, F_EXPANDABLE};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -29,8 +29,8 @@ const FRN_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 // ---------------------------------------------------------------------------
 // Raw volume reading (sector-aligned buffers, sequential over dataruns)
 
-struct Volume {
-    file: std::fs::File,
+pub struct Volume {
+    pub file: std::fs::File,
     sector: u64,
 }
 
@@ -116,7 +116,8 @@ impl AlignedBuf {
         let layout = std::alloc::Layout::from_size_align(capacity, 4096).expect("layout");
         let ptr = unsafe { std::alloc::alloc(layout) };
         assert!(!ptr.is_null(), "volume buffer alloc failed");
-        unsafe { std::ptr::write_bytes(ptr, 0, capacity) };
+        // no zero-fill: read_at writes every byte below `len` before any
+        // parse reads it (saves ~30ms of memset across the 4×64MB pool)
         AlignedBuf { ptr, len, capacity }
     }
     fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -208,10 +209,15 @@ impl MftLayout {
             return None;
         }
         // record 0 is `$MFT` itself; its non-resident `$DATA` runs describe
-        // the physical layout of the whole MFT
-        let mut rec = AlignedBuf::new(record_bytes as usize);
+        // the physical layout of the whole MFT. NO_BUFFERING reads must be
+        // sector-aligned in length too: on 4Kn volumes a 1024-byte record is
+        // read padded to a whole sector and the fixup runs on the prefix.
+        let rb = record_bytes as usize;
+        let bps = bytes_per_sector as usize;
+        let read_len = rb.div_ceil(bps) * bps;
+        let mut rec = AlignedBuf::new(read_len);
         vol.read_at(mft_lcn * sectors_per_cluster, &mut rec).ok()?;
-        let fixed = fixed_up(rec.bytes(), bytes_per_sector as usize)?;
+        let fixed = fixed_up(&rec.bytes()[..rb], bytes_per_sector as usize)?;
         let mut attrs = [AttrView::default(); MAX_ATTRS];
         let n = walk_attributes_buf(&fixed, &mut attrs)?;
         let mut runs = Vec::new();
@@ -699,7 +705,7 @@ pub fn needs_admin(drive: &str) -> bool {
     if !letter.is_ascii_alphabetic() {
         return false;
     }
-    match std::fs::File::open(format!(r"\.\{letter}:")) {
+    match std::fs::File::open(format!(r"\\.\{letter}:")) {
         Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
         _ => false,
     }
@@ -718,6 +724,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         progress.files.store(0, Ordering::Relaxed);
         progress.errors.store(0, Ordering::Relaxed);
     };
+    let t_open = std::time::Instant::now();
     let mut vol = match Volume::open(drive) {
         Some(v) => v,
         None => {
@@ -725,6 +732,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
             return false;
         }
     };
+    super::scanlog::line(&format!("mft {drive}: volume open {:.1}ms", t_open.elapsed().as_secs_f32() * 1000.0));
     let lay = match MftLayout::parse(&mut vol) {
         Some(l) => l,
         None => {
@@ -741,6 +749,27 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         lay.total_bytes as f64 / 1e6,
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
     ));
+
+    // USN-cache fast path (DECISIONS.md DEC-SCAN-005): rebuild from the last
+    // scan's tree and replay journal changes. Any doubt falls through to the
+    // full scan below with the tree untouched.
+    if let Some(cache) = super::usncache::load(drive) {
+        let t_cache = std::time::Instant::now();
+        match super::usncache::apply(&tree, cache, &mut vol, drive, &progress) {
+            Ok((cp, frn_of)) => {
+                super::scanlog::line(&format!(
+                    "usn cache: hit — tree rebuilt in {:.2}s (checkpoint usn {})",
+                    t_cache.elapsed().as_secs_f32(),
+                    cp.next_usn
+                ));
+                super::usncache::spawn_persist(drive.to_string(), tree, frn_of, vol);
+                return true;
+            }
+            Err(reason) => {
+                super::scanlog::line(&format!("usn cache: discarded ({reason}) — full scan"));
+            }
+        }
+    }
     let t_start = std::time::Instant::now();
     progress.set_status("Reading NTFS master file table");
     progress.expected.store(lay.total_bytes, Ordering::Relaxed);
@@ -748,7 +777,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     // Per-thread staging maps: every thread parses its slice of each chunk
     // into its own maps, merged once after the read loop. Record numbers are
     // absolute MFT stream positions / record size, so threads stay consistent.
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
     let est_dirs = ((lay.total_bytes / lay.record_bytes) / 16) as usize;
     let mut tdirs: Vec<HashMap<u64, Staged>> = (0..threads).map(|_| HashMap::with_capacity((est_dirs / threads).max(1024))).collect();
     let mut texts: Vec<HashMap<u64, u64>> = (0..threads).map(|_| HashMap::new()).collect();
@@ -758,19 +787,26 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     // only when a cluster is smaller than a record) are skipped by keeping
     // every read on the absolute record grid.
     let record = lay.record_bytes as usize;
+    // I/O grid: every planned read must contain whole records (the absolute
+    // record grid) AND be sector-aligned for FILE_FLAG_NO_BUFFERING — on 4Kn
+    // volumes those two differ, so round to their least common multiple.
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let grid: u64 = record as u64 / gcd(record as u64, lay.bytes_per_sector) * lay.bytes_per_sector;
     let chunk: u64 = 64 << 20;
     let mut plan: Vec<(u64, u64, u64)> = Vec::new(); // (lba, bytes, record_base)
     let mut stream_pos: u64 = 0;
     for &(lcn, clusters) in &lay.runs {
         let run_bytes = clusters.saturating_mul(lay.cluster_bytes);
         let run_lba = lcn * lay.cluster_bytes / lay.bytes_per_sector;
-        let misalign = stream_pos % lay.record_bytes;
-        let mut done = if misalign != 0 { lay.record_bytes - misalign } else { 0 };
+        let misalign = stream_pos % grid;
+        let mut done = if misalign != 0 { grid - misalign } else { 0 };
         done = done.min(run_bytes);
         stream_pos += done;
         while done < run_bytes {
             let mut want = (run_bytes - done).min(chunk);
-            want -= want % lay.record_bytes; // whole records only
+            want -= want % grid; // whole records, sector-aligned
             if want == 0 {
                 break; // sub-record tail: skipped by the grid realignment
             }
@@ -787,8 +823,12 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
     // so the whole pass costs ~max(I/O, parse) instead of their sum.
     let read_failed: std::sync::Arc<std::sync::Mutex<Option<String>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
     // two readers on separate unbuffered handles, interleaving the plan:
-    // two outstanding reads give the NVMe queue depth it wants (~2x I/O)
-    let (tx, rx): (std::sync::mpsc::Sender<AlignedBuf>, std::sync::mpsc::Receiver<AlignedBuf>) = std::sync::mpsc::channel();
+    // two outstanding reads give the NVMe queue depth it wants (~2x I/O).
+    // Buffers travel WITH their absolute record base — two interleaved
+    // readers complete chunks out of plan order, and assigning bases by
+    // arrival order would corrupt every FRN in the wrong chunk.
+    type Chunk = (u64, AlignedBuf);
+    let (tx, rx): (std::sync::mpsc::Sender<Chunk>, std::sync::mpsc::Receiver<Chunk>) = std::sync::mpsc::channel();
     let (tx_back, rx_back): (std::sync::mpsc::Sender<AlignedBuf>, std::sync::mpsc::Receiver<AlignedBuf>) = std::sync::mpsc::channel();
     let back_shared: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<AlignedBuf>>> =
         std::sync::Arc::new(std::sync::Mutex::new(rx_back));
@@ -796,7 +836,10 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         std::sync::Arc::new(std::sync::Mutex::new((0..4).map(|_| AlignedBuf::new(chunk as usize)).collect()));
     let mut readers = Vec::new();
     for reader_id in 0..2u8 {
-        let Some(mut vol_r) = Volume::open(drive) else { break };
+        let Some(mut vol_r) = Volume::open(drive) else {
+            super::scanlog::line("mft: reader handle open failed (sharing violation?)");
+            break;
+        };
         let plan_r: Vec<(u64, u64, u64)> = plan
             .clone()
             .into_iter()
@@ -810,7 +853,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         let fail_flag = read_failed.clone();
         let p_r = progress.clone();
         readers.push(std::thread::spawn(move || {
-            'plan: for &(lba, want, _base) in &plan_r {
+            'plan: for &(lba, want, base) in &plan_r {
                 if p_r.cancelled() {
                     break 'plan;
                 }
@@ -829,25 +872,22 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
                     }
                     break 'plan;
                 }
-                if tx.send(buf).is_err() {
+                if tx.send((base, buf)).is_err() {
                     break 'plan;
                 }
             }
         }));
     }
     drop(tx); // readers hold their own senders; rx ends when all are done
-    drop(vol); // the layout handle is no longer needed
+    // `vol` stays open: the post-scan cache writer reuses this handle to
+    // take the USN checkpoint (spawn_persist at the end of run)
     let mut seen_bytes = 0u64;
-    let mut plan_idx = 0usize;
-    while let Ok(buf) = rx.recv() {
+    let mut got_chunks = 0usize;
+    while let Ok((record_base, buf)) = rx.recv() {
         if progress.cancelled() {
             break;
         }
         let want = buf.len() as u64;
-        // absolute record numbers come from the plan (skipped tails are
-        // already accounted there); seen_bytes alone would drift
-        let record_base = plan.get(plan_idx).map(|&(_, _, rb)| rb).unwrap_or(seen_bytes / lay.record_bytes);
-        plan_idx += 1;
         let b = buf.bytes();
         {
             let n = b.len() / record;
@@ -899,6 +939,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
             });
         }
         seen_bytes = (seen_bytes + want).min(total_bytes);
+        got_chunks += 1;
         progress.bytes.store(seen_bytes, Ordering::Relaxed);
         progress.files.store(tlive.iter().sum::<u64>(), Ordering::Relaxed);
         if tx_back.send(buf).is_err() {
@@ -921,7 +962,7 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         ));
     }
     if let Some(err) = read_failed.lock().unwrap().take() {
-        super::scanlog::line(&format!("mft: reader failed after {}/{} chunks: {err}", plan_idx, plan.len()));
+        super::scanlog::line(&format!("mft: reader failed after {}/{} chunks: {err}", got_chunks, plan.len()));
         restore(&progress);
         return false;
     }
@@ -991,113 +1032,155 @@ pub fn run(tree: SharedTree, drive: &str, progress: Arc<Progress>, limits: ScanL
         st.finish_files();
     }
 
-    // assemble: children index, then BFS from the root
-    progress.set_status("Building tree");
-    let t_assemble = std::time::Instant::now();
-    let mut kids: HashMap<u64, Vec<u64>> = HashMap::new();
-    let keys: Vec<u64> = dirs.keys().copied().collect();
-    for frn in keys {
-        if frn == ROOT_FRN {
-            continue;
-        }
-        if let Some(st) = dirs.get(&frn) {
-            if st.named() && st.parent != frn {
-                kids.entry(st.parent).or_default().push(frn);
-            }
-        }
-    }
-
-    {
-        let mut t = tree.write().unwrap();
-        let root = t.root;
-        // node estimate: staged dirs + their kept files (live/4 measured on a
-        // real volume: 5.4M live -> 1.36M nodes); avoids ~40 arena regrows
-        t.reserve(dirs.values().map(|d| d.files.len()).sum::<usize>().saturating_add(dirs.len()).saturating_add(16));
-        if let Some(m) = dirs.get(&ROOT_FRN).map(|d| d.mtime) {
-            t.set_mtime(root, m);
-        }
-        let mut node_of: HashMap<u64, u32> = HashMap::new();
-        node_of.insert(ROOT_FRN, root);
-        let mut queue: VecDeque<u64> = VecDeque::new();
-        queue.push_back(ROOT_FRN);
-        let mut total_files = 0u32;
-        // assemble in frontier batches, releasing the tree write lock between
-        // batches so the sunburst keeps animating while the tree fills
-        while !queue.is_empty() {
-            let batch: Vec<u64> = queue.drain(..2048.min(queue.len())).collect();
-            for frn in batch {
-                assemble_one(&mut t, &mut dirs, &mut node_of, &mut queue, &mut total_files, frn, &ext, &kids, &limits, &progress);
-            }
-            drop(t);
-            t = tree.write().unwrap();
-        }
-        t.get_mut(root).flags |= F_DONE;
-        // staged dirs never reached from the root (orphaned cycles, records
-        // for deleted parents) are dropped; hidden-space absorbs their size
-        super::scanlog::line(&format!(
-            "mft: assembly {:.2}s — {} nodes",
-            t_assemble.elapsed().as_secs_f32(),
-            t.nodes.len()
-        ));
-    }
+    // assemble bottom-up: reverse-BFS subtree totals, then one creation
+    // pass whose nodes are born with their final sizes (no ancestor walks)
+    let frn_nodes = assemble(&tree, dirs, &ext, &progress);
+    // post-scan cache write on its own thread (checkpoint + ~100MB
+    // serialization must never sit on the scan critical path); it also
+    // carries the volume handle out and drops it when done
+    super::usncache::spawn_persist(drive.to_string(), tree, frn_nodes, vol);
     true
 }
 
-/// Assembles one staged directory into the tree: file/mount/small children,
-/// one roll-up `add_size`, and child-dir nodes queued for the next batch.
-#[allow(clippy::too_many_arguments)]
-fn assemble_one(
-    t: &mut Tree,
-    dirs: &mut HashMap<u64, Staged>,
-    node_of: &mut HashMap<u64, u32>,
-    queue: &mut VecDeque<u64>,
-    total_files: &mut u32,
-    frn: u64,
-    ext: &HashMap<u64, u64>,
-    kids: &HashMap<u64, Vec<u64>>,
-    _limits: &ScanLimits,
-    progress: &Progress,
-) {
-    let Some(st) = dirs.remove(&frn) else { return };
-    let node = node_of[&frn];
-    if frn != ROOT_FRN {
-        t.get_mut(node).flags |= F_DONE;
-    }
-    let mut size_sum = 0u64;
-    let mut file_count = 0u32;
-    for (ffrn, name, size, mtime) in st.files.iter() {
-        let mut sz = *size;
-        if let Some(extra) = ext.get(ffrn) {
-            sz = sz.saturating_add(*extra); // $ATTRIBUTE_LIST: split $DATA runs
-        }
-        let id = t.add_child(node, name, Kind::File, sz, 1);
-        t.set_mtime(id, *mtime);
-        size_sum = size_sum.saturating_add(sz);
-        file_count += 1;
-        *total_files += 1;
-    }
-    for name in &st.mounts {
-        t.add_child(node, name, Kind::Mount, 0, 0);
-    }
-    if st.small_count > 0 {
-        let id = t.add_child(node, SMALL_FILES_NAME, Kind::SmallFiles, st.small_size, st.small_count);
-        t.get_mut(id).flags |= F_EXPANDABLE;
-        size_sum = size_sum.saturating_add(st.small_size);
-        file_count = file_count.saturating_add(st.small_count);
-        *total_files += st.small_count;
-    }
-    if size_sum > 0 || file_count > 0 {
-        t.add_size(node, size_sum.min(i64::MAX as u64) as i64, file_count as i64);
-    }
-    for cfrn in kids.get(&frn).map(|v| v.as_slice()).unwrap_or(&[]) {
-        if let Some(cst) = dirs.get(cfrn) {
-            let id = t.add_child(node, &cst.name, Kind::Dir, 0, 0);
-            t.set_mtime(id, cst.mtime);
-            node_of.insert(*cfrn, id);
-            queue.push_back(*cfrn);
+/// Assembles the staged directories into the arena tree.
+///
+/// Two passes over a BFS order from the root. The reverse order accumulates
+/// every directory's final subtree total bottom-up (reverse BFS guarantees
+/// each child is final before its parent sums it); the forward order then
+/// creates the nodes with those totals directly, so `add_size` ancestor
+/// walks disappear entirely — they cost one hop per depth level per
+/// directory, ~7M hops on a real volume.
+///
+/// Returns the frn→node list for the USN cache (assembled dirs + kept files).
+fn assemble(tree: &SharedTree, mut dirs: HashMap<u64, Staged>, ext: &HashMap<u64, u64>, progress: &Progress) -> Vec<(u64, u32)> {
+    let t0 = std::time::Instant::now();
+    // children index, pre-sized: rehashing ~600k entries costs ~30ms
+    let mut kids: HashMap<u64, Vec<u64>> = HashMap::with_capacity(dirs.len());
+    let file_est: usize = dirs.values().map(|d| d.files.len()).sum();
+    for (&frn, st) in dirs.iter() {
+        if frn != ROOT_FRN && st.named() && st.parent != frn {
+            kids.entry(st.parent).or_default().push(frn);
         }
     }
-    progress.files.store(*total_files as u64, Ordering::Relaxed);
+    // BFS order from the root; each staged dir appears under exactly one
+    // parent (map keys), so no visited set is needed. Dirs the BFS never
+    // reaches (orphaned cycles, records for deleted parents) stay in `dirs`
+    // and are dropped — hidden-space absorbs their size, as before.
+    let mut order: Vec<u64> = Vec::with_capacity(dirs.len());
+    let mut pos_of: HashMap<u64, u32> = HashMap::with_capacity(dirs.len());
+    order.push(ROOT_FRN);
+    pos_of.insert(ROOT_FRN, 0);
+    let mut i = 0;
+    while i < order.len() {
+        let frn = order[i];
+        i += 1;
+        if let Some(cs) = kids.get(&frn) {
+            for &c in cs {
+                pos_of.insert(c, order.len() as u32);
+                order.push(c);
+            }
+        }
+    }
+    // bottom-up totals: own files (+ extension-record $DATA) + small fold,
+    // then each dir pushes its final total into its parent's slot
+    let mut totals: Vec<(u64, u32)> = vec![(0, 0); order.len()];
+    for pos in (0..order.len()).rev() {
+        let Some(st) = dirs.get(&order[pos]) else { continue };
+        let mut sz = st.small_size;
+        let mut fc = st.small_count;
+        for &(ffrn, _, size, _) in &st.files {
+            sz = sz.saturating_add(size.saturating_add(ext.get(&ffrn).copied().unwrap_or(0)));
+            fc += 1;
+        }
+        sz = sz.saturating_add(totals[pos].0);
+        fc = fc.saturating_add(totals[pos].1);
+        totals[pos] = (sz, fc);
+        if pos != 0 {
+            if let Some(&p) = pos_of.get(&st.parent) {
+                let (ps, pf) = &mut totals[p as usize];
+                *ps = ps.saturating_add(sz);
+                *pf = pf.saturating_add(fc);
+            }
+        }
+    }
+    let pre_secs = t0.elapsed().as_secs_f32();
+
+    // forward creation. Batches of 2048 release the write lock between them
+    // so the sunburst keeps animating while the tree fills.
+    progress.set_status("Building tree");
+    let mut dir_nodes: Vec<u32> = vec![0; order.len()];
+    let mut frn_nodes: Vec<(u64, u32)> = Vec::with_capacity(order.len().saturating_add(file_est));
+    let mut t = tree.write().unwrap();
+    let root = t.root;
+    t.reserve(file_est.saturating_add(order.len()).saturating_add(16));
+    dir_nodes[0] = root;
+    if let Some(m) = dirs.get(&ROOT_FRN).map(|d| d.mtime) {
+        t.set_mtime(root, m);
+    }
+    let mut seen_files = 0u32;
+    for pos in 0..order.len() {
+        let Some(st) = dirs.remove(&order[pos]) else { continue };
+        let node = if pos == 0 {
+            root // already exists: this position only attaches its children
+        } else {
+            let Some(&ppos) = pos_of.get(&st.parent) else { continue };
+            let id = t.add_child_owned(dir_nodes[ppos as usize], st.name.into(), Kind::Dir, totals[pos].0, totals[pos].1);
+            dir_nodes[pos] = id;
+            {
+                let n = t.get_mut(id);
+                n.flags |= F_DONE;
+                n.mtime = st.mtime;
+            }
+            frn_nodes.push((order[pos], id));
+            id
+        };
+        // own children, in the order the engine always used: big files,
+        // mounts, the small-files fold, then the child dirs (created when
+        // their own positions come up — same sibling chain as before). Names
+        // move out of the staging map: no per-node allocation on this path.
+        let kept = st.files.len() as u32;
+        for (ffrn, name, size, mtime) in st.files {
+            let sz = size.saturating_add(ext.get(&ffrn).copied().unwrap_or(0));
+            let id = t.add_child_owned(node, name.into(), Kind::File, sz, 1);
+            t.get_mut(id).mtime = mtime;
+            frn_nodes.push((ffrn, id));
+        }
+        for name in st.mounts {
+            t.add_child_owned(node, name.into(), Kind::Mount, 0, 0);
+        }
+        if st.small_count > 0 {
+            let id = t.add_child_owned(node, SMALL_FILES_NAME.into(), Kind::SmallFiles, st.small_size, st.small_count);
+            t.get_mut(id).flags |= F_EXPANDABLE;
+        }
+        seen_files = seen_files.saturating_add(kept).saturating_add(st.small_count);
+        if (pos + 1) % 2048 == 0 || pos + 1 == order.len() {
+            progress.files.store(seen_files as u64, Ordering::Relaxed);
+            drop(t);
+            t = tree.write().unwrap();
+        }
+    }
+    // the root carries the exact roll-up: its size must equal the sum of
+    // everything reachable from it (the bench asserts this on the corpus)
+    {
+        let r = t.get_mut(root);
+        r.size = totals[0].0;
+        r.files = totals[0].1;
+        r.flags |= F_DONE;
+    }
+    let nodes_len = t.nodes.len();
+    drop(t);
+    super::scanlog::line(&format!(
+        "mft: assembly {:.2}s (order+totals {:.2}s, create {:.2}s) — {} nodes, {} frn entries",
+        t0.elapsed().as_secs_f32(),
+        pre_secs,
+        t0.elapsed().as_secs_f32() - pre_secs,
+        nodes_len,
+        frn_nodes.len(),
+    ));
+    // leftover (unreachable) staged dirs hold real Strings — free them on a
+    // throwaway thread so the scan tail doesn't pay for a million drops
+    std::thread::spawn(move || drop(dirs));
+    frn_nodes
 }
 
 // ---------------------------------------------------------------------------
@@ -1398,6 +1481,33 @@ mod tests {
             st.finish_files();
         }
         eprintln!("FULLDUMP: merge+drain {:.2}s - {} dirs", t_m.elapsed().as_secs_f32(), dirs.len());
+        // assembly, through the same code path the engine uses (bottom-up
+        // totals + direct-size creation). The root roll-up is asserted:
+        // root size/files must equal the sum over its children.
+        let tree = std::sync::Arc::new(std::sync::RwLock::new(crate::tree::Tree::new("C:\\", "C:", crate::tree::Source::Local)));
+        let progress = Progress::default();
+        let dirs_before = dirs.len();
+        let t_a = std::time::Instant::now();
+        let frn_nodes = assemble(&tree, dirs, &ext, &progress);
+        let asm = t_a.elapsed().as_secs_f32();
+        let t = tree.read().unwrap();
+        let root = t.get(t.root);
+        let child_sum: u64 = t.children(t.root).map(|c| t.get(c).size).sum();
+        let child_files: u64 = t.children(t.root).map(|c| t.get(c).files as u64).sum();
+        eprintln!(
+            "FULLDUMP: assembly {:.2}s - {} nodes from {} staged dirs, root size {} (children sum {}, exact={}), root files {} (children {}), {} frn entries",
+            asm,
+            t.nodes.len(),
+            dirs_before,
+            crate::tree::fmt_size(root.size),
+            crate::tree::fmt_size(child_sum),
+            root.size == child_sum,
+            root.files,
+            child_files,
+            frn_nodes.len()
+        );
+        assert_eq!(root.size, child_sum, "root size must equal the sum of its children");
+        assert_eq!(u64::from(root.files), child_files, "root file count must equal the sum of its children");
     }
 
 
@@ -1539,5 +1649,52 @@ mod tests {
         assert_eq!(a.files.len(), 1);
         assert_eq!(a.small_count, 1);
         assert_eq!(a.small_size, 100);
+    }
+
+    /// The bottom-up assembly must produce exactly the sizes the old
+    /// per-directory add_size walk produced: every directory's size/files
+    /// equal the sum of its live children, and kept files/mounts/folds keep
+    /// their shapes. Also checks the frn→node list handed to the USN cache.
+    #[test]
+    fn assemble_bottom_up_rollup() {
+        // root(5) → a(100){f(200, 8KB), tiny(201, 100B → fold)} → b(101){g(300, 1MB)}
+        let limits = ScanLimits { keep_min: 4096, max_files_per_dir: 8 };
+        let mut dirs = HashMap::new();
+        let mut ext = HashMap::new();
+        stage(&mut dirs, &mut ext, 5, parse_record(&synth_record(true, 5, ".", None)).unwrap(), &limits);
+        stage(&mut dirs, &mut ext, 100, parse_record(&synth_record(true, 5, "a", None)).unwrap(), &limits);
+        stage(&mut dirs, &mut ext, 101, parse_record(&synth_record(true, 100, "b", None)).unwrap(), &limits);
+        stage(&mut dirs, &mut ext, 200, parse_record(&synth_record(false, 100, "f", Some(8192))).unwrap(), &limits);
+        stage(&mut dirs, &mut ext, 201, parse_record(&synth_record(false, 100, "tiny", Some(100))).unwrap(), &limits);
+        stage(&mut dirs, &mut ext, 300, parse_record(&synth_record(false, 101, "g", Some(1 << 20))).unwrap(), &limits);
+        for st in dirs.values_mut() {
+            st.finish_files();
+        }
+        let tree = std::sync::Arc::new(std::sync::RwLock::new(crate::tree::Tree::new("X:\\", "X:", crate::tree::Source::Local)));
+        let frn_nodes = assemble(&tree, dirs, &ext, &Progress::default());
+        let t = tree.read().unwrap();
+        // directories roll up exactly; file/fold nodes are atoms
+        fn subtree(t: &crate::tree::Tree, id: u32) -> (u64, u32) {
+            let n = t.get(id);
+            if n.kind != Kind::Dir {
+                return (n.size, n.files);
+            }
+            let mut s = 0u64;
+            let mut f = 0u32;
+            for c in t.children(id) {
+                let (cs, cf) = subtree(t, c);
+                s += cs;
+                f += cf;
+            }
+            assert_eq!((n.size, n.files), (s, f), "dir node {id} roll-up");
+            (s, f)
+        }
+        let (s, f) = subtree(&t, t.root);
+        assert_eq!(s, 8192 + 100 + (1 << 20));
+        assert_eq!(f, 3); // f, g, and the one folded tiny file
+        // frn map: dirs a + b, kept files f + g; root and the fold have none
+        assert_eq!(frn_nodes.len(), 4);
+        let frns: std::collections::HashSet<u64> = frn_nodes.iter().map(|&(frn, _)| frn).collect();
+        assert!(frns.contains(&100) && frns.contains(&101) && frns.contains(&200) && frns.contains(&300));
     }
 }

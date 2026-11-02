@@ -36,8 +36,14 @@ pub fn node_label(t: &Tree, id: u32) -> String {
 }
 
 fn view_label(t: &Tree, v: View) -> String {
+    view_label_counted(t, v, t.child_count(v.node))
+}
+
+/// Same as [`view_label`], but takes the folder's cached child count so
+/// Group views don't walk the sibling chain every frame.
+fn view_label_counted(t: &Tree, v: View, kids_len: usize) -> String {
     if v.skip > 0 {
-        let n = t.child_count(v.node).saturating_sub(v.skip);
+        let n = kids_len.saturating_sub(v.skip);
         trf("{count} smaller items", &[("count", &fmt_count(n as u64))])
     } else {
         node_label(t, v.node)
@@ -340,7 +346,10 @@ impl App {
 
         // --- geometry
         let s = &mut self.sessions[si];
-        let t = s.tree.read().unwrap();
+        // guard borrows a clone of the Arc, not s itself: keeps s free for the
+        // kids-cache write below (direct s.tree.read() would pin all of s)
+        let tree_arc = s.tree.clone();
+        let t = tree_arc.read().unwrap();
         let root = t.root;
         let collector = s.collector.clone();
         let draw = s.anim.draw_list();
@@ -376,8 +385,15 @@ impl App {
         let hovered_anim = s.hovered_key.and_then(|k| s.anim.anims.get(&k)).filter(|a| a.d > 0.5).cloned();
         let center_anim_color = s.anim.anims.get(&s.view.key()).map(|a| a.color);
         let view = s.view;
-        let center_label = view_label(&t, view);
-        let center_size = sunburst::view_size(&t, view);
+        // cached sorted children: the center label + size used to re-sort the
+        // whole folder and walk its sibling chain every frame
+        let (view_kids, view_sum) = s.sorted_kids(&t, view.node);
+        let center_label = view_label_counted(&t, view, view_kids.len());
+        let center_size = if view.skip > 0 {
+            view_kids[view.skip.min(view_kids.len())..].iter().map(|k| t.get(*k).size).sum::<u64>()
+        } else {
+            t.get(view.node).size.max(view_sum)
+        };
         let hovered_label = hovered_anim.as_ref().map(|a| match a.kind {
             SegKind::Group { count, .. } => (trf("{count} smaller items", &[("count", &fmt_count(count as u64))]), a.size),
             SegKind::Free => (tr("Free space").to_string(), a.size),
@@ -544,23 +560,60 @@ impl App {
             return;
         }
         let treemap_mode = self.settings.chart_style == "treemap";
-        let s = &self.sessions[si];
+        let s = &mut self.sessions[si];
         let pv = s.panel_view;
         let selected = s.selected;
         let list_hover_before = s.list_hover;
-        let t = s.tree.read().unwrap();
+        // guard borrows a clone of the Arc, not s itself: keeps s free for the
+        // kids-cache write below (direct s.tree.read() would pin all of s)
+        let tree_arc = s.tree.clone();
+        let t = tree_arc.read().unwrap();
         if !t.is_alive(pv.node) {
             return;
         }
-        let mut kids = t.sorted_children(pv.node);
-        if pv.skip > 0 {
-            kids = kids.split_off(pv.skip.min(kids.len()));
-        }
-        let total = sunburst::view_size(&t, pv).max(1);
-        let title = if pv.node == t.root && pv.skip == 0 { s.title.clone() } else { view_label(&t, pv) };
-        let files = t.get(pv.node).files;
         // SquirrelDisk-AI fork: 26px lower for the FILES/AI tab strip.
         let inner = Rect::from_min_max(Pos2::new(panel.left() + 18.0, panel.top() + 16.0 + 26.0), Pos2::new(panel.right() - 18.0, panel.bottom() - 16.0));
+
+        // hidden space: say what it is (row geometry needs its height)
+        let mut note_h = 0.0;
+        if t.get(pv.node).kind == Kind::Hidden {
+            let text = tr("Space in use on the disk that is not in files the scan could read. It cannot be opened or deleted from here.");
+            let p = ui.painter();
+            let g = p.layout(text.to_string(), font(12.0), theme.text_dim, inner.width());
+            note_h = g.size().y + 10.0;
+            p.galley(inner.left_top() + Vec2::new(0.0, 56.0), g, theme.text_dim);
+        }
+
+        // rows geometry
+        let row_h = 30.0;
+        let top = inner.top() + 58.0 + note_h;
+        let footer_h = if pv.node == t.root && matches!(s.target, Target::Volume(_)) { 64.0 } else { 26.0 };
+        let avail = inner.bottom() - footer_h - top;
+        let max_rows = ((avail / row_h).floor() as usize).max(1);
+
+        // One short &mut borrow: pull everything the frame needs out of the
+        // two-slot sorted-children cache (visible row ids, counts, sums), so
+        // the rest of the function can read s freely. Sorting a wide folder
+        // used to happen twice per frame, on every frame.
+        let (kids, all_len, tail_len, total, show, more) = {
+            let (all_kids, kids_sum) = s.sorted_kids(&t, pv.node);
+            let all_len = all_kids.len();
+            let tail = &all_kids[pv.skip.min(all_len)..];
+            let tail_len = tail.len();
+            let tail_sum: u64 = if pv.skip > 0 { tail.iter().map(|k| t.get(*k).size).sum() } else { 0 };
+            let total = (if pv.skip > 0 { tail_sum } else { t.get(pv.node).size.max(kids_sum) }).max(1);
+            let overflow = tail_len > max_rows;
+            let show = if overflow { max_rows - 1 } else { tail_len };
+            let more = if overflow {
+                let rest: u64 = tail[show..].iter().map(|c| t.get(*c).size).sum();
+                Some((tail_len - show, rest, View { node: pv.node, skip: pv.skip + show }))
+            } else {
+                None
+            };
+            (tail[..show].to_vec(), all_len, tail_len, total, show, more)
+        };
+        let title = if pv.node == t.root && pv.skip == 0 { s.title.clone() } else { view_label_counted(&t, pv, all_len) };
+        let files = t.get(pv.node).files;
 
         // header
         let p = ui.painter().clone();
@@ -572,26 +625,9 @@ impl App {
         p.galley(Pos2::new(inner.right() - sg.size().x, inner.top() + 1.0), sg, theme.text);
         // live counts change fast: keep them compact until the scan is done
         let count = |n: u64| if s.is_scanning() { crate::tree::fmt_count_compact(n) } else { fmt_count(n) };
-        let sub = trf("{files} files · {items} items", &[("files", &count(files as u64)), ("items", &count(kids.len() as u64))]);
+        let sub = trf("{files} files · {items} items", &[("files", &count(files as u64)), ("items", &count(tail_len as u64))]);
         p.text(inner.left_top() + Vec2::new(0.0, 32.0), Align2::LEFT_TOP, sub, font(12.0), theme.text_faint);
 
-        // hidden space: say what it is
-        let mut note_h = 0.0;
-        if t.get(pv.node).kind == Kind::Hidden {
-            let text = tr("Space in use on the disk that is not in files the scan could read. It cannot be opened or deleted from here.");
-            let g = p.layout(text.to_string(), font(12.0), theme.text_dim, inner.width());
-            note_h = g.size().y + 10.0;
-            p.galley(inner.left_top() + Vec2::new(0.0, 56.0), g, theme.text_dim);
-        }
-
-        // rows
-        let row_h = 30.0;
-        let top = inner.top() + 58.0 + note_h;
-        let footer_h = if pv.node == t.root && matches!(s.target, Target::Volume(_)) { 64.0 } else { 26.0 };
-        let avail = inner.bottom() - footer_h - top;
-        let max_rows = ((avail / row_h).floor() as usize).max(1);
-        let overflow = kids.len() > max_rows;
-        let show = if overflow { max_rows - 1 } else { kids.len() };
         struct Row {
             node: u32,
             label: String,
@@ -601,7 +637,7 @@ impl App {
             denied: bool,
             collected: bool,
         }
-        let rows: Vec<Row> = kids[..show]
+        let rows: Vec<Row> = kids
             .iter()
             .map(|&c| {
                 let n = t.get(c);
@@ -612,12 +648,6 @@ impl App {
                 Row { node: c, label: node_label(&t, c), size: n.size, color, kind: n.kind, denied: n.denied(), collected: s.is_collected(&t, c) }
             })
             .collect();
-        let more = if overflow {
-            let rest: u64 = kids[show..].iter().map(|c| t.get(*c).size).sum();
-            Some((kids.len() - show, rest, View { node: pv.node, skip: pv.skip + show }))
-        } else {
-            None
-        };
         let hovered_path = selected.or(list_hover_before).filter(|n| t.is_alive(*n) && t.get(*n).kind != Kind::Hidden).map(|n| t.path(n));
         let is_root_volume = pv.node == t.root && pv.skip == 0;
         drop(t);
